@@ -2,15 +2,15 @@
 import { DateTime } from "luxon";
 import { settings } from "../shared/settings";
 import { buildInvite, type InviteKind } from "../shared/ics";
+import { b64, buildMime } from "./mime";
 
 export type Mail = { from: string; to: string; replyTo?: string; subject: string; text: string; html: string;
-  attachments?: { filename: string; content: string; type: string }[] };
+  ics?: string; icsMethod?: "REQUEST" | "CANCEL" };
 export type Sender = { name: string; send(m: Mail): Promise<void> };
 export type Kind = "confirmed" | "requested" | "accepted" | "declined" | "moved" | "cancelled" | "reminder";
 type Db = { one: (sql: string, ...p: any[]) => Promise<any>; all: (sql: string, ...p: any[]) => Promise<any[]>; run: (sql: string, ...p: any[]) => Promise<{ changes: number }>; nowIso: () => string };
 
 export const mask = (to: string) => String(to).replace(/^(.).*(@.*)$/, "$1***$2");
-const b64 = (s: string) => { const b = new TextEncoder().encode(s); let o = ""; for (const x of b) o += String.fromCharCode(x); return btoa(o); };
 
 export function provider(env: any): "" | "cloudflare" | "resend" | "test" {
   const p = String(env.EMAIL_PROVIDER ?? "").trim().toLowerCase();
@@ -36,18 +36,21 @@ export function parseFrom(from: string): string | { email: string; name: string 
 export function makeSender(env: any, db: Db): Sender {
   const p = provider(env);
   if (p === "cloudflare") return { name: p, async send(m) {
-    await env.EMAIL.send({ from: parseFrom(m.from), to: m.to, replyTo: m.replyTo, subject: m.subject, text: m.text, html: m.html,
-      attachments: m.attachments?.map((a) => ({ filename: a.filename, content: b64(a.content), type: a.type, disposition: "attachment" })) });
+    // Raw MIME (EmailMessage) so the invite is an inline text/calendar part, which Gmail needs for its event card.
+    const f = parseFrom(m.from); const from = typeof f === "string" ? { email: f } : f;
+    const { EmailMessage } = await import("cloudflare:email");
+    await env.EMAIL.send(new EmailMessage(from.email, m.to, buildMime({ ...m, from })));
   } };
   if (p === "resend") return { name: p, async send(m) {
     const r = await fetch("https://api.resend.com/emails", { method: "POST", headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ from: m.from, to: [m.to], reply_to: m.replyTo, subject: m.subject, text: m.text, html: m.html,
-        attachments: m.attachments?.map((a) => ({ filename: a.filename, content: b64(a.content), content_type: a.type })) }) });
+        attachments: m.ics ? [{ filename: "invite.ics", content: b64(m.ics), content_type: `text/calendar; charset=utf-8; method=${m.icsMethod}` }] : undefined }) });
     if (!r.ok) throw new Error(`Resend answered ${r.status}: ${(await r.text()).slice(0, 200)}`);
   } };
   if (p === "test") return { name: p, async send(m) {
     if (/^fail@/i.test(m.to)) throw new Error("Test sender refused this address");
-    await db.run("INSERT INTO test_outbox (recipient,reply_to,subject,text,html,ics,created_at) VALUES (?,?,?,?,?,?,?)", m.to, m.replyTo ?? "", m.subject, m.text, m.html, m.attachments?.[0]?.content ?? "", db.nowIso());
+    const f = parseFrom(m.from); const from = typeof f === "string" ? { email: f } : f;
+    await db.run("INSERT INTO test_outbox (recipient,reply_to,subject,text,html,ics,mime,created_at) VALUES (?,?,?,?,?,?,?,?)", m.to, m.replyTo ?? "", m.subject, m.text, m.html, m.ics ?? "", buildMime({ ...m, from }), db.nowIso());
   } };
   return { name: "log", async send(m) { console.log(`[mail] to=${mask(m.to)} ${m.subject.split(":")[0]}`); } };
 }
@@ -117,6 +120,7 @@ function inviteKind(kind: Kind, b: MailBooking): InviteKind | null {
 export function makeMailer(env: any, db: Db, origin: string) {
   const sender = makeSender(env, db);
   const from = String(env.EMAIL_FROM || `"${settings.appName}" <bookings@example.com>`);
+  const fromAddr = ((f) => (typeof f === "string" ? f : f.email))(parseFrom(from));
   async function load(uid: string): Promise<MailBooking | undefined> {
     const b = await db.one(`SELECT b.*,u.name AS host_name,u.email AS host_email,u.time_zone AS host_tz FROM bookings b JOIN users u ON u.id=b.host_id WHERE b.uid=?`, uid);
     if (b) b.guests = JSON.parse(b.guests || "[]");
@@ -141,9 +145,12 @@ export function makeMailer(env: any, db: Db, origin: string) {
       const ik = noInvite ? null : inviteKind(kind, b);
       const ics = ik ? buildInvite({ uid: b.uid, icsUid: b.ics_uid, title: b.title, startUtc: b.start_utc, endUtc: b.end_utc, location: b.location, notes: b.notes,
         hostName: b.host_name, hostEmail: b.host_email, bookerName: b.booker_name, bookerEmail: b.booker_email, guests: b.guests }, ik, b.ics_sequence ?? 0,
-        { origin, appName: settings.appName, now: db.nowIso(), audience }) : null;
+        { origin, appName: settings.appName, now: db.nowIso(), audience,
+          // Gmail won't load an invite whose ORGANIZER is the recipient, so the host's copy is organized by the
+          // sending address and lists the host as an accepted attendee.
+          organizer: audience === "host" ? { name: settings.appName, email: fromAddr } : undefined }) : null;
       await sender.send({ from, to, replyTo: audience === "guest" ? b.host_email : b.booker_email, ...r,
-        attachments: ics ? [{ filename: "invite.ics", content: ics, type: `text/calendar; charset=utf-8; method=${ik === "cancel" ? "CANCEL" : "REQUEST"}` }] : undefined });
+        ics: ics ?? undefined, icsMethod: ik === "cancel" ? "CANCEL" : "REQUEST" });
       await db.run("UPDATE email_log SET status='sent',sent_at=?,error='' WHERE booking_uid=? AND kind=? AND offset_min=? AND recipient=?", db.nowIso(), b.uid, kind, offset, to);
     } catch (e: any) {
       const msg = String(e?.message ?? e).slice(0, 300);

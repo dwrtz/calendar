@@ -4,5 +4,5 @@
     "jsx": "react-jsx", "strict": true, "esModuleInterop": true, "skipLibCheck": true,
     "resolveJsonModule": true, "types": ["node"], "lib": ["ES2023", "DOM", "DOM.Iterable"], "noEmit": true
   },
-  "include": ["subtle-crypto.d.ts", "src/client", "src/shared", "tests", "e2e", "vite.config.ts", "playwright.config.ts"]
+  "include": ["subtle-crypto.d.ts", "src/client", "src/shared", "src/worker/cloudflare-email.d.ts", "tests", "e2e", "vite.config.ts", "playwright.config.ts"]
 }

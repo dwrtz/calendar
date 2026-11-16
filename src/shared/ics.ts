@@ -4,7 +4,7 @@ export type InviteBooking = {
   hostName: string; hostEmail: string; bookerName: string; bookerEmail: string; guests: string[];
 };
 export type InviteKind = "request" | "cancel" | "publish";
-export type InviteContext = { origin: string; appName: string; now: string; audience: "host" | "guest" };
+export type InviteContext = { origin: string; appName: string; now: string; audience: "host" | "guest"; organizer?: { name: string; email: string } };
 
 export function escapeText(s: string): string {
   return String(s ?? "").replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r\n|\r|\n/g, "\\n");
@@ -47,8 +47,8 @@ export function buildInvite(b: InviteBooking, kind: InviteKind, sequence: number
     `DTSTART:${icsTime(b.startUtc)}`,
     `DTEND:${icsTime(b.endUtc)}`,
     `SUMMARY:${escapeText(summary)}`,
-    `ORGANIZER;CN=${param(b.hostName)}:mailto:${b.hostEmail}`,
-    `ATTENDEE;CN=${param(b.hostName)};ROLE=CHAIR;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:${b.hostEmail}`,
+    ctx.organizer ? `ORGANIZER;CN=${param(ctx.organizer.name)}:mailto:${ctx.organizer.email}` : `ORGANIZER;CN=${param(b.hostName)}:mailto:${b.hostEmail}`,
+    `ATTENDEE;CN=${param(b.hostName)};ROLE=${ctx.organizer ? "REQ-PARTICIPANT" : "CHAIR"};PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:${b.hostEmail}`,
     ...attendees.map((e) => `ATTENDEE;CN=${param(e === b.bookerEmail ? b.bookerName : e)};ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:${e}`),
     `STATUS:${kind === "cancel" ? "CANCELLED" : "CONFIRMED"}`,
     "TRANSP:OPAQUE",

@@ -24,6 +24,18 @@ test("R15/R16 booking, moving and cancelling each email the guest and the host o
   expect(prop(guest.ics, "METHOD")).toBe("REQUEST"); expect(prop(guest.ics, "SEQUENCE")).toBe("0"); expect(prop(guest.ics, "STATUS")).toBe("CONFIRMED");
   const UID = prop(guest.ics, "UID");
   expect(UID).toBe(`${uid}@127.0.0.1`);
+  // Gmail: the guest copy is organized by the host; the host copy by the sending address with the host as an accepted attendee
+  expect(prop(guest.ics, "ORGANIZER")).toBe("mailto:alex@example.com");
+  expect(prop(host.ics, "ORGANIZER")).toBe("mailto:bookings@example.com");
+  expect(host.ics.replace(/\r\n[ \t]/g, "")).toContain("PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:alex@example.com");
+  expect(prop(host.ics, "UID")).toBe(UID);
+  for (const x of [guest, host]) {
+    expect(x.mime).toMatch(/^Content-Type: multipart\/mixed; boundary=/m);
+    expect(x.mime).toMatch(/^Content-Type: multipart\/alternative; boundary=/m);
+    expect(x.mime).toContain("Content-Type: text/calendar; charset=UTF-8; method=REQUEST");
+    expect(x.mime).toContain('Content-Disposition: attachment; filename="invite.ics"');
+    expect(x.mime.replace(/\r\n/g, "")).not.toContain("\n");
+  }
   await page.goto(`/booking/${uid}`);
   await expect(page.getByText("We've emailed you the details.")).toBeVisible();
   // move it
@@ -44,6 +56,8 @@ test("R15/R16 booking, moving and cancelling each email the guest and the host o
   const c = (await mailsFor(request, uid2)).filter((x) => x.subject.startsWith("Cancelled:"));
   expect(c.length).toBe(2);
   const cg = c.find((x) => x.recipient === "pat@example.com");
+  expect(c.find((x) => x.recipient === "alex@example.com").mime).toContain("text/calendar; charset=UTF-8; method=CANCEL");
+  expect(prop(c.find((x) => x.recipient === "alex@example.com").ics, "ORGANIZER")).toBe("mailto:bookings@example.com");
   expect(prop(cg.ics, "METHOD")).toBe("CANCEL"); expect(prop(cg.ics, "STATUS")).toBe("CANCELLED"); expect(prop(cg.ics, "SEQUENCE")).toBe("2"); expect(prop(cg.ics, "UID")).toBe(UID);
   expect(cg.text).toContain("Reason: Clash");
 });
