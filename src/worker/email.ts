@@ -28,10 +28,15 @@ export function emailProblem(env: any): string {
 }
 export const emailOn = (env: any) => !!provider(env) && !emailProblem(env);
 
+/** '"Name" <addr@x>' -> { email, name }; a bare address stays a string. */
+export function parseFrom(from: string): string | { email: string; name: string } {
+  const m = String(from).trim().match(/^"?([^"<]*?)"?\s*<([^>]+)>$/);
+  return m ? (m[1].trim() ? { email: m[2].trim(), name: m[1].trim() } : m[2].trim()) : String(from).trim();
+}
 export function makeSender(env: any, db: Db): Sender {
   const p = provider(env);
   if (p === "cloudflare") return { name: p, async send(m) {
-    await env.EMAIL.send({ from: m.from, to: m.to, replyTo: m.replyTo, subject: m.subject, text: m.text, html: m.html,
+    await env.EMAIL.send({ from: parseFrom(m.from), to: m.to, replyTo: m.replyTo, subject: m.subject, text: m.text, html: m.html,
       attachments: m.attachments?.map((a) => ({ filename: a.filename, content: b64(a.content), type: a.type, disposition: "attachment" })) });
   } };
   if (p === "resend") return { name: p, async send(m) {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { render, mask, offsetText, provider, emailProblem, type MailBooking } from "../src/worker/email";
+import { parseFrom, render, mask, offsetText, provider, emailProblem, type MailBooking } from "../src/worker/email";
 import { hintFor, checkFeedUrl } from "../src/worker/calendars";
 
 const b: MailBooking = { uid: "u1", title: "Intro call", start_utc: "2026-11-17T15:00:00.000Z", end_utc: "2026-11-17T15:30:00.000Z", location: "https://meet.example.com/a",
@@ -25,6 +25,10 @@ describe("R15 email", () => {
     expect(emailProblem({ EMAIL_PROVIDER: "resend", EMAIL_FROM: "a@b.co" })).toMatch(/RESEND_API_KEY/);
     expect(emailProblem({ EMAIL_PROVIDER: "cloudflare" })).toMatch(/EMAIL_FROM/);
     expect(mask("pat@example.com")).toBe("p***@example.com"); expect(offsetText(10080)).toBe("1 week"); expect(offsetText(15)).toBe("15 minutes");
+  });
+  it("splits a display-name From for the Email Sending binding", () => {
+    expect(parseFrom('"Scheduler" <bookings@calendar.example.com>')).toEqual({ email: "bookings@calendar.example.com", name: "Scheduler" });
+    expect(parseFrom("bookings@x.com")).toBe("bookings@x.com"); expect(parseFrom("<b@x.com>")).toBe("b@x.com");
   });
   it("shows only a hint of a feed address and accepts only https", () => {
     const h = hintFor("https://calendar.google.com/calendar/ical/x%40gmail.com/private-0123456789abcdef/basic.ics");
