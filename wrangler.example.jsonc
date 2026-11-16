@@ -1,0 +1,44 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "calendar",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-11-16",
+  // "account_id": "<YOUR_CLOUDFLARE_ACCOUNT_ID>",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "calendar",
+      "database_id": "<YOUR_D1_DATABASE_ID>",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "NOW": "",
+    "TEST_CLOCK": "0",
+    // "1" allows new accounts, "0" refuses them (existing accounts can still sign in).
+    "ALLOW_SIGNUP": "1",
+    // Comma-separated. Empty = no extra restriction. Example: "you@example.com".
+    "ALLOWED_EMAILS": "",
+    // Optional email: "" (off), "cloudflare", or "resend".
+    "EMAIL_PROVIDER": "",
+    // Example: "Scheduler <bookings@example.com>"
+    "EMAIL_FROM": "",
+    // Public URL of the deployed site, used in email links. Example: "https://calendar.example.com"
+    "SITE_URL": "",
+    "ICAL_POLL_MINUTES": "10"
+  },
+  // Uncomment after onboarding a domain in Cloudflare Email Sending:
+  // "send_email": [{ "name": "EMAIL" }],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  // Optional custom domain (replace with yours):
+  // "routes": [{ "pattern": "calendar.example.com", "custom_domain": true }],
+  // "workers_dev": false,
+  // "preview_urls": false,
+  "observability": { "enabled": true, "traces": { "enabled": true } }
+}

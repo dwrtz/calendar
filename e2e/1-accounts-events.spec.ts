@@ -1,0 +1,126 @@
+import { test, expect } from "@playwright/test";
+import { login, slots } from "./helpers";
+
+test.describe.configure({ mode: "serial" });
+
+test("R2 sign up, refuse duplicates and reserved names, guard", async ({ page }) => {
+  await page.goto("/signup");
+  await page.getByLabel("Name", { exact: true }).fill("Sam Host");
+  await page.getByLabel("Email", { exact: true }).fill("sam@example.com");
+  await page.getByLabel("Username", { exact: true }).fill("bookings");
+  await page.getByLabel("Password", { exact: true }).fill("password-123");
+  await page.getByRole("button", { name: "Create account", exact: true }).click();
+  await expect(page.getByText("That username is reserved")).toBeVisible();
+  await page.getByLabel("Username", { exact: true }).fill("alex");
+  await page.getByRole("button", { name: "Create account", exact: true }).click();
+  await expect(page.getByText("That username is taken")).toBeVisible();
+  await page.getByLabel("Username", { exact: true }).fill("sam");
+  await page.getByRole("button", { name: "Create account", exact: true }).click();
+  await expect(page).toHaveURL(/\/event-types$/);
+  await expect(page.getByText("Quick chat")).toBeVisible();
+  await expect(page.locator(".et-row strong").filter({ hasText: /^Meeting$/ })).toBeVisible();
+  await page.getByRole("link", { name: "Availability", exact: true }).click();
+  await expect(page.getByText("Mon - Fri, 9:00am - 5:00pm")).toBeVisible();
+  await expect(page.getByText("America/New_York")).toBeVisible();
+  await page.getByRole("button", { name: "User menu", exact: true }).first().click();
+  await page.getByRole("menuitem", { name: "Sign out", exact: true }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  await page.goto("/event-types");
+  await expect(page).toHaveURL(/\/login$/);
+  await page.getByLabel("Email", { exact: true }).fill("sam@example.com");
+  await page.getByLabel("Password", { exact: true }).fill("wrong-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "Email or password is wrong" })).toBeVisible();
+  await page.goto("/signup");
+  await page.getByLabel("Name", { exact: true }).fill("Sam Two");
+  await page.getByLabel("Email", { exact: true }).fill("SAM@example.com");
+  await page.getByLabel("Username", { exact: true }).fill("sam-two");
+  await page.getByLabel("Password", { exact: true }).fill("password-123");
+  await page.getByRole("button", { name: "Create account", exact: true }).click();
+  await expect(page.getByText("That email already has an account")).toBeVisible();
+});
+
+test("R3 layout at desktop and phone widths", async ({ page }) => {
+  await login(page, "sam@example.com", "password-123");
+  for (const name of ["Event types", "Bookings", "Availability", "Settings"]) await expect(page.getByRole("link", { name, exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Bookings", exact: true }).click();
+  await expect(page).toHaveURL(/\/bookings\/upcoming$/);
+  await expect(page.getByRole("heading", { name: "Bookings", exact: true })).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 800 });
+  const bar = page.locator(".sidebar nav");
+  await expect(bar).toBeVisible();
+  const box = await bar.boundingBox();
+  expect(box!.y).toBeGreaterThan(700);
+  await page.getByRole("link", { name: "Settings", exact: true }).click();
+  await expect(page).toHaveURL(/\/settings\/profile$/);
+});
+
+test("R4 event types: create, edit every tab, hide, duplicate, delete", async ({ page, request }) => {
+  await login(page, "sam@example.com", "password-123");
+  await page.getByRole("button", { name: "New", exact: true }).click();
+  await page.getByLabel("Title", { exact: true }).fill("Strategy Session");
+  await expect(page.getByLabel("URL slug", { exact: true })).toHaveValue("strategy-session");
+  await page.getByLabel("Duration (minutes)", { exact: true }).fill("45");
+  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await expect(page).toHaveURL(/\/event-types\/\d+\?tab=setup$/);
+  await page.getByLabel("Description", { exact: true }).fill("Plan the quarter.");
+  await page.getByLabel("Location", { exact: true }).selectOption("in_person");
+  await page.getByLabel("Address", { exact: true }).fill("12 Main St");
+  await page.getByRole("tab", { name: "Limits", exact: true }).click();
+  await expect(page).toHaveURL(/tab=limits/);
+  await page.getByLabel("Buffer after", { exact: true }).selectOption("15");
+  await page.getByLabel("Minimum notice", { exact: true }).fill("1");
+  await page.getByLabel("Slot step", { exact: true }).selectOption("30");
+  await page.getByRole("switch", { name: "Limit bookings per day", exact: true }).click();
+  await page.getByLabel("Bookings per day", { exact: true }).fill("3");
+  await page.getByRole("tab", { name: "Advanced", exact: true }).click();
+  await page.getByRole("switch", { name: "Requires approval", exact: true }).click();
+  await page.getByRole("radio", { name: "#047857", exact: true }).click();
+  await page.getByRole("tab", { name: "Availability", exact: true }).click();
+  await expect(page.getByText("Mon - Fri, 9:00am - 5:00pm")).toBeVisible();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByText("Saved")).toBeVisible();
+  await page.reload();
+  await page.getByRole("tab", { name: "Setup", exact: true }).click();
+  await expect(page.getByLabel("Description", { exact: true })).toHaveValue("Plan the quarter.");
+  await expect(page.getByLabel("Address", { exact: true })).toHaveValue("12 Main St");
+  await page.getByRole("tab", { name: "Limits", exact: true }).click();
+  await expect(page.getByLabel("Buffer after", { exact: true })).toHaveValue("15");
+  await expect(page.getByLabel("Minimum notice", { exact: true })).toHaveValue("1");
+  await expect(page.getByLabel("Notice unit", { exact: true })).toHaveValue("hours");
+  await expect(page.getByLabel("Slot step", { exact: true })).toHaveValue("30");
+  await expect(page.getByLabel("Bookings per day", { exact: true })).toHaveValue("3");
+  await page.getByRole("tab", { name: "Advanced", exact: true }).click();
+  await expect(page.getByRole("switch", { name: "Requires approval", exact: true })).toHaveAttribute("aria-checked", "true");
+  // slug clash
+  await page.getByRole("tab", { name: "Setup", exact: true }).click();
+  await page.getByLabel("URL slug", { exact: true }).fill("meeting");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByText("You already use that URL")).toBeVisible();
+  await page.getByLabel("URL slug", { exact: true }).fill("strategy-session");
+  // hide via list
+  await page.getByRole("link", { name: "Back to event types", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Discard changes?", exact: true })).toHaveCount(0);
+  await page.getByRole("switch", { name: "Hide Strategy Session", exact: true }).click();
+  await expect(page.getByRole("switch", { name: "Hide Strategy Session", exact: true })).toHaveAttribute("aria-checked", "true");
+  const prof = await (await request.get("/api/public/users/sam")).json();
+  expect(prof.eventTypes.map((e: any) => e.slug)).toEqual(["quick-chat", "meeting"]);
+  const s = await slots(request, "sam", "strategy-session");
+  expect(Object.keys(s).length).toBeGreaterThan(0);
+  // duplicate then delete the copy
+  await page.getByRole("button", { name: "More for Strategy Session", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Duplicate", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Strategy Session (copy)", exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: "Limits", exact: true }).click();
+  await expect(page.getByLabel("Buffer after", { exact: true })).toHaveValue("15");
+  await page.getByRole("link", { name: "Back to event types", exact: true }).click();
+  await expect(page.getByText("/sam/strategy-session-copy")).toBeVisible();
+  await page.getByRole("button", { name: "More for Strategy Session (copy)", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Delete", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+  await expect(page.getByText("/sam/strategy-session-copy")).toHaveCount(0);
+  // move up
+  await page.getByRole("button", { name: "More for Meeting", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Move up", exact: true }).click();
+  await expect(page.locator(".et-row strong").first()).toHaveText("Meeting");
+});

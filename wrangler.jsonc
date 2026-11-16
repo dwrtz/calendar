@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "calendar",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-11-16",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "calendar",
+      // Replace with your D1 id before a production deploy. Local `wrangler dev` does not need the real id.
+      "database_id": "<YOUR_D1_DATABASE_ID>",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "NOW": "",
+    "TEST_CLOCK": "0",
+    "ALLOW_SIGNUP": "1",
+    // Comma-separated allowlist for sign-up, sign-in and sessions.
+    // Empty (the default) means no extra restriction. Example: "you@example.com".
+    "ALLOWED_EMAILS": "",
+    // Optional integrations (email, invites, iCal busy times); each is off while empty.
+    // Secrets (ENCRYPTION_KEY, RESEND_API_KEY) are set with `wrangler secret put`, never here.
+    "EMAIL_PROVIDER": "",
+    "EMAIL_FROM": "",
+    "SITE_URL": "",
+    "ICAL_POLL_MINUTES": "10"
+  },
+  // Reminders, email retries and iCal polling.
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "observability": { "enabled": true, "traces": { "enabled": true } }
+}
