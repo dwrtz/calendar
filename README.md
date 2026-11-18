@@ -4,8 +4,6 @@ Built from the Spekkr spec dwrtz/scheduling-app: https://spekkr.com/dwrtz/schedu
 
 Build line: `Build the spec at https://spekkr.com/dwrtz/scheduling-app/start.md`
 
-Live demo: [https://calendar.beef-able.com](https://calendar.beef-able.com)
-
 A scheduling app that runs as one Cloudflare Worker (static assets + JSON API) with a D1 database. People book time on your public page; you manage event types, availability and bookings after signing in. You can optionally restrict sign-up and sign-in to a list of emails.
 
 Email, calendar invites and busy-time blocking from a secret iCal address are optional and off until you configure them.
@@ -60,7 +58,7 @@ Set these in `wrangler.jsonc` (or as Worker vars in the dashboard). Secrets are 
 | `ALLOW_SIGNUP` | `"1"` | `"1"` allows new accounts, `"0"` refuses them. Existing accounts can still sign in. |
 | `ALLOWED_EMAILS` | `""` | Comma-separated allowlist for sign-up, sign-in and existing sessions. Empty or unset means no extra restriction. Example: `"you@example.com"`. |
 | `EMAIL_PROVIDER` | `""` | `""` (off), `"cloudflare"`, or `"resend"`. |
-| `EMAIL_FROM` | `""` | From address on your verified domain, e.g. `"Scheduler <bookings@example.com>"`. |
+| `EMAIL_FROM` | `""` | From address on your verified domain, e.g. `"Scheduler <bookings@example.com>"`. It is also the invites' organizer, so it must receive mail through Email Routing (see below). |
 | `SITE_URL` | `""` | Public URL of the site, used in email links, e.g. `"https://calendar.example.com"`. |
 | `ICAL_POLL_MINUTES` | `"10"` | How often to refresh busy times from a connected iCal feed (5–15). |
 | `ENCRYPTION_KEY` | (secret) | Required only if you paste a secret iCal address. 32 bytes, base64. |
@@ -94,10 +92,30 @@ Each one is off until configured; the app works the same without them. Status an
 
 Booking, request, accept/decline, move and cancel emails go to the guest (and listed guests) and to you, with an `invite.ics` that shows as confirmed in both calendars. A reschedule updates the existing event instead of adding a second one. Reminders (per event type: 1 week / 1 day / 1 hour / 15 min before, on the event's Limits tab) are sent by the Cron Trigger, each at most once.
 
-- **Cloudflare Email Sending:** needs the Workers Paid plan to send to any address (3,000 emails a month included, then $0.35 per 1,000) and the domain on Cloudflare DNS. Dashboard: Compute > Email Service > Email Sending > Onboard Domain; it adds SPF and DKIM TXT records, DMARC on `_dmarc.<domain>` and `cf-bounce` MX records. When the domain shows as verified, add `"send_email": [{ "name": "EMAIL" }]` to `wrangler.jsonc` (see [`wrangler.example.jsonc`](./wrangler.example.jsonc)), set `EMAIL_PROVIDER=cloudflare`, `EMAIL_FROM="Scheduler" <bookings@your-domain>` and `SITE_URL=https://your-site`, and deploy.
-- **Resend:** verify the domain in Resend (add the SPF/DKIM records it gives you in Cloudflare DNS), then `npx wrangler secret put RESEND_API_KEY`, set `EMAIL_PROVIDER=resend`, `EMAIL_FROM` and `SITE_URL`, and deploy.
+- **Cloudflare Email Sending:** needs the Workers Paid plan to send to any address (3,000 emails a month included, then $0.35 per 1,000) and the domain on Cloudflare DNS. Dashboard: Compute > Email Service > Email Sending > Onboard Domain; it adds SPF and DKIM TXT records, DMARC on `_dmarc.<domain>` and `cf-bounce` MX records. When the domain shows as verified, add `"send_email": [{ "name": "EMAIL" }]` to `wrangler.jsonc` (see [`wrangler.example.jsonc`](./wrangler.example.jsonc)), set `EMAIL_PROVIDER=cloudflare`, `EMAIL_FROM="Scheduler" <bookings@your-domain>` and `SITE_URL=https://your-site`, set up receiving (below), and deploy.
+- **Resend:** verify the domain in Resend (add the SPF/DKIM records it gives you in Cloudflare DNS), then `npx wrangler secret put RESEND_API_KEY`, set `EMAIL_PROVIDER=resend`, `EMAIL_FROM` and `SITE_URL`, set up receiving (below; the `EMAIL_FROM` domain must be on Cloudflare DNS for Email Routing), and deploy.
 
-`migrations/0002_integrations.sql` adds the tables and columns these need. It only adds; apply it with `npx wrangler d1 migrations apply DB --remote`.
+#### Receiving calendar replies (required with email)
+
+Every emailed invite names your `EMAIL_FROM` address as the iCalendar `ORGANIZER`, so calendar apps send their replies (accept, maybe, decline, proposed new time) there. That address must receive mail, or Gmail and others retry and then warn the person who replied that delivery failed. **Sending and receiving are configured separately:**
+
+- Email Sending's `cf-bounce` MX records belong to the bounce subdomain (`cf-bounce.<your sending domain>`). They do **not** make your `EMAIL_FROM` address receive mail. Leave them as they are.
+- Receiving needs MX records at the organizer address's own domain (the part after `@` in `EMAIL_FROM`, e.g. `calendar.example.com`), which Cloudflare Email Routing adds.
+
+Setup (Cloudflare Email Routing, free, needs the domain on Cloudflare DNS):
+
+1. Dashboard: Compute > Email Service > Email Routing, enable it for the organizer address's domain or subdomain (e.g. `calendar.example.com`). It adds three MX records and an SPF TXT record on that name. If that name already has MX or SPF records from another mail provider, choose a different `EMAIL_FROM` domain instead of replacing them.
+2. Add a routing rule: custom address = your `EMAIL_FROM` address (e.g. `bookings@calendar.example.com`), action **Send to a Worker**, Worker = this app.
+3. Deploy. Check with `dig MX calendar.example.com`.
+
+The Worker's `email()` handler reads each message's `text/calendar` part (iTIP `METHOD:REPLY` or `COUNTER`), matches its `UID` to a booking, and accepts it only when the replying `ATTENDEE` is on that booking and the SMTP sender is that attendee (or the attendee's calendar service, such as Google Calendar's bounce address, with the attendee in `From`). Anything else is rejected with a permanent SMTP error; nothing is forwarded and nothing is ever sent back to the sender.
+
+- Accepted and maybe update that person's status in your bookings list, with no email.
+- A guest's decline emails you (with a link to the booking). The booking is not cancelled.
+- If you decline your own copy, the booking shows "You declined this in your calendar. Cancel the booking?" with "Cancel booking" and "Keep it". It is never cancelled for you.
+- A proposed new time is shown on the booking for you; nothing is moved.
+
+`migrations/0002_integrations.sql` adds the tables and columns these need; `migrations/0004_rsvp.sql` adds `booking_rsvps` for calendar replies. They only add; apply them with `npx wrangler d1 migrations apply DB --remote`.
 
 ## Settings (`spekkr.inputs.json`)
 

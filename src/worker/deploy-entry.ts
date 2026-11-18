@@ -33,4 +33,5 @@ export default {
     return app.fetch(req, { ...env, ASSETS: { fetch: (r: Request) => Promise.resolve(serve(r)) } } as unknown as Env, ctx);
   },
   async scheduled(c: ScheduledController, env: Env, ctx: ExecutionContext) { return app.scheduled(c, env, ctx); },
+  async email(m: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) { return app.email(m, env, ctx); },
 } satisfies ExportedHandler<Env>;

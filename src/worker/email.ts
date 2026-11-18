@@ -3,11 +3,12 @@ import { DateTime } from "luxon";
 import { settings } from "../shared/settings";
 import { buildInvite, type InviteKind } from "../shared/ics";
 import { b64, buildMime } from "./mime";
+import { normAddress } from "../shared/itip";
 
 export type Mail = { from: string; to: string; replyTo?: string; subject: string; text: string; html: string;
   ics?: string; icsMethod?: "REQUEST" | "CANCEL" };
 export type Sender = { name: string; send(m: Mail): Promise<void> };
-export type Kind = "confirmed" | "requested" | "accepted" | "declined" | "moved" | "cancelled" | "reminder";
+export type Kind = "confirmed" | "requested" | "accepted" | "declined" | "moved" | "cancelled" | "reminder" | "rsvp_declined";
 type Db = { one: (sql: string, ...p: any[]) => Promise<any>; all: (sql: string, ...p: any[]) => Promise<any[]>; run: (sql: string, ...p: any[]) => Promise<{ changes: number }>; nowIso: () => string };
 
 export const mask = (to: string) => String(to).replace(/^(.).*(@.*)$/, "$1***$2");
@@ -27,6 +28,17 @@ export function emailProblem(env: any): string {
   return "";
 }
 export const emailOn = (env: any) => !!provider(env) && !emailProblem(env);
+/** The address that sends mail; the default is a placeholder that only the log and test senders use. */
+export const fromHeader = (env: any) => String(env.EMAIL_FROM || `"${settings.appName}" <bookings@example.com>`);
+export const addressOf = (from: string) => ((f) => (typeof f === "string" ? f : f.email))(parseFrom(from)).toLowerCase();
+/**
+ * iTIP organizer for every invite this deployment emails (R16, R19): the sending address (EMAIL_FROM), so calendar
+ * replies come back to the app's own mailbox. Undefined while email is off; the download then names the host.
+ */
+export function organizerFor(env: any): { name: string; email: string } | undefined {
+  if (!emailOn(env)) return undefined;
+  return { name: settings.appName, email: addressOf(fromHeader(env)) };
+}
 
 /** '"Name" <addr@x>' -> { email, name }; a bare address stays a string. */
 export function parseFrom(from: string): string | { email: string; name: string } {
@@ -70,7 +82,9 @@ export function offsetText(min: number) {
 
 export type MailBooking = { uid: string; title: string; start_utc: string; end_utc: string; location: string; notes: string; status: string;
   booker_name: string; booker_email: string; booker_tz: string; guests: string[]; host_name: string; host_email: string; host_tz: string;
-  cancel_reason?: string; cancelled_by?: string | null; reschedule_reason?: string; ics_uid?: string | null; ics_sequence?: number };
+  cancel_reason?: string; cancelled_by?: string | null; reschedule_reason?: string; ics_uid?: string | null; ics_sequence?: number;
+  /** For rsvp_declined: who declined in their calendar (R19). */
+  decliner?: { name: string; email: string; comment?: string } };
 
 /** Subject, plain text and HTML for one recipient. */
 export function render(kind: Kind, b: MailBooking, audience: "guest" | "host", origin: string, offsetMin = 0) {
@@ -83,6 +97,7 @@ export function render(kind: Kind, b: MailBooking, audience: "guest" | "host", o
     confirmed: `Confirmed: ${tail}`, accepted: `Confirmed: ${tail}`, moved: `Moved: ${tail}`, cancelled: `Cancelled: ${tail}`,
     requested: audience === "host" ? `New request: ${tail}` : `Request received: ${tail}`, declined: `Declined: ${tail}`,
     reminder: `Reminder: ${b.title} with ${other} starts in ${offsetText(offsetMin)}`,
+    rsvp_declined: `Declined: ${b.title} with ${b.decliner?.name || other} on ${w.short}`,
   };
   const by = b.cancelled_by === "host" ? b.host_name : b.booker_name;
   const lead: Record<Kind, string> = {
@@ -93,12 +108,13 @@ export function render(kind: Kind, b: MailBooking, audience: "guest" | "host", o
     moved: `This meeting moved to a new time. The old time is cancelled.${b.reschedule_reason ? ` Reason: ${b.reschedule_reason}` : ""}`,
     cancelled: `${by} cancelled this meeting.${b.cancel_reason ? ` Reason: ${b.cancel_reason}` : ""}`,
     reminder: `Your meeting starts in ${offsetText(offsetMin)}.`,
+    rsvp_declined: `${b.decliner?.name || "A guest"} declined this meeting in their calendar.${b.decliner?.comment ? ` Note: ${b.decliner.comment}` : ""} The booking is still on: cancel or reschedule it from your bookings if it isn't happening.`,
   };
   const isLink = /^https?:\/\//i.test(b.location);
   const rows: [string, string][] = [["What", b.title], ["When", `${w.day}\n${w.range}`], ["Who", `${b.host_name} (host)\n${b.booker_name} <${b.booker_email}>${b.guests?.length ? "\n" + b.guests.join("\n") : ""}`]];
   if (b.location) rows.push(["Where", b.location]);
   if (b.notes) rows.push(["Notes", b.notes]);
-  const live = !["cancelled", "declined"].includes(kind);
+  const live = !["cancelled", "declined", "rsvp_declined"].includes(kind);
   const actions = audience === "guest" && live ? `Need a change? Reschedule: ${page}\nCancel: ${page}` : `Booking page: ${page}`;
   const text = [lead[kind], "", ...rows.map(([k, v]) => `${k}: ${v.replace(/\n/g, "\n  ")}`), "", actions, "", `Sent by ${settings.appName}`].join("\n");
   const html = `<!doctype html><html><body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#111827;background:#f9fafb;padding:24px">
@@ -119,8 +135,10 @@ function inviteKind(kind: Kind, b: MailBooking): InviteKind | null {
 
 export function makeMailer(env: any, db: Db, origin: string) {
   const sender = makeSender(env, db);
-  const from = String(env.EMAIL_FROM || `"${settings.appName}" <bookings@example.com>`);
-  const fromAddr = ((f) => (typeof f === "string" ? f : f.email))(parseFrom(from));
+  const from = fromHeader(env);
+  // Every emailed invite names the sending address as ORGANIZER (R16), so calendar replies come back to the
+  // app (R19). Gmail also won't load an invite whose ORGANIZER is the recipient, which rules out the host.
+  const organizer = { name: settings.appName, email: addressOf(from) };
   async function load(uid: string): Promise<MailBooking | undefined> {
     const b = await db.one(`SELECT b.*,u.name AS host_name,u.email AS host_email,u.time_zone AS host_tz FROM bookings b JOIN users u ON u.id=b.host_id WHERE b.uid=?`, uid);
     if (b) b.guests = JSON.parse(b.guests || "[]");
@@ -141,14 +159,17 @@ export function makeMailer(env: any, db: Db, origin: string) {
     if (sender.name === "log") { console.log(`[mail] to=${mask(to)} ${kind} ${b.uid}`); return; }
     if (!(await claim(b.uid, kind, offset, to))) return;
     try {
+      if (kind === "rsvp_declined") {
+        // offset_min holds the booking_rsvps row id, so a retry can rebuild the same email.
+        const r = await db.one("SELECT email,name,comment FROM booking_rsvps WHERE id=? AND booking_uid=?", offset, b.uid);
+        if (!r) throw new Error("RSVP row not found");
+        b = { ...b, decliner: { email: r.email, name: r.email === normAddress(b.booker_email) ? b.booker_name : r.name || r.email, comment: r.comment } };
+      }
       const r = render(kind, b, audience, origin, offset);
       const ik = noInvite ? null : inviteKind(kind, b);
       const ics = ik ? buildInvite({ uid: b.uid, icsUid: b.ics_uid, title: b.title, startUtc: b.start_utc, endUtc: b.end_utc, location: b.location, notes: b.notes,
         hostName: b.host_name, hostEmail: b.host_email, bookerName: b.booker_name, bookerEmail: b.booker_email, guests: b.guests }, ik, b.ics_sequence ?? 0,
-        { origin, appName: settings.appName, now: db.nowIso(), audience,
-          // Gmail won't load an invite whose ORGANIZER is the recipient, so the host's copy is organized by the
-          // sending address and lists the host as an accepted attendee.
-          organizer: audience === "host" ? { name: settings.appName, email: fromAddr } : undefined }) : null;
+        { origin, appName: settings.appName, now: db.nowIso(), audience, organizer }) : null;
       await sender.send({ from, to, replyTo: audience === "guest" ? b.host_email : b.booker_email, ...r,
         ics: ics ?? undefined, icsMethod: ik === "cancel" ? "CANCEL" : "REQUEST" });
       await db.run("UPDATE email_log SET status='sent',sent_at=?,error='' WHERE booking_uid=? AND kind=? AND offset_min=? AND recipient=?", db.nowIso(), b.uid, kind, offset, to);
@@ -164,6 +185,13 @@ export function makeMailer(env: any, db: Db, origin: string) {
       const b = await load(uid); if (!b) return;
       for (const r of recipients(b)) await deliver(kind, b, r.to, r.audience, 0, !!opts.noInvite);
     } catch (e: any) { console.error(JSON.stringify({ mail: "notify failed", kind, error: String(e?.message ?? e) })); }
+  }
+  /** Email only the host, for example when a guest declines in their calendar (R19). Never throws. */
+  async function notifyHost(kind: Kind, uid: string, offset: number) {
+    try {
+      const b = await load(uid); if (!b) return;
+      await deliver(kind, b, b.host_email, "host", offset, true);
+    } catch (e: any) { console.error(JSON.stringify({ mail: "notifyHost failed", kind, error: String(e?.message ?? e) })); }
   }
   /** Cron: reminders whose send time fell in the last `windowMin` minutes (and after the booking was made), and retries. */
   async function runReminders(windowMin = 15) {
@@ -190,5 +218,5 @@ export function makeMailer(env: any, db: Db, origin: string) {
     }
     return { reminders, retried: failed.length };
   }
-  return { notify, runReminders, sender };
+  return { notify, notifyHost, runReminders, sender };
 }

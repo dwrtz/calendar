@@ -24,8 +24,9 @@ test("R15/R16 booking, moving and cancelling each email the guest and the host o
   expect(prop(guest.ics, "METHOD")).toBe("REQUEST"); expect(prop(guest.ics, "SEQUENCE")).toBe("0"); expect(prop(guest.ics, "STATUS")).toBe("CONFIRMED");
   const UID = prop(guest.ics, "UID");
   expect(UID).toBe(`${uid}@127.0.0.1`);
-  // Gmail: the guest copy is organized by the host; the host copy by the sending address with the host as an accepted attendee
-  expect(prop(guest.ics, "ORGANIZER")).toBe("mailto:alex@example.com");
+  // Every emailed copy is organized by the sending address (Gmail won't load a host copy the host organizes, and
+  // calendar replies must come back to the app, R19); the host is an accepted attendee
+  expect(prop(guest.ics, "ORGANIZER")).toBe("mailto:bookings@example.com");
   expect(prop(host.ics, "ORGANIZER")).toBe("mailto:bookings@example.com");
   expect(host.ics.replace(/\r\n[ \t]/g, "")).toContain("PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:alex@example.com");
   expect(prop(host.ics, "UID")).toBe(UID);
@@ -50,6 +51,7 @@ test("R15/R16 booking, moving and cancelling each email the guest and the host o
   // the download uses the same UID and sequence
   const dl = await (await request.get(`/api/public/bookings/${uid2}/ics`)).text();
   expect(prop(dl, "UID")).toBe(UID); expect(prop(dl, "SEQUENCE")).toBe("1"); expect(prop(dl, "METHOD")).toBe("PUBLISH");
+  expect(prop(dl, "ORGANIZER")).toBe("mailto:bookings@example.com");
   // cancel it
   await request.post(`/api/public/bookings/${uid2}/cancel`, { data: { reason: "Clash" } });
   await expect.poll(async () => (await mailsFor(request, uid2)).length).toBe(4);
@@ -152,4 +154,38 @@ test("R15 event reminders are editable on the Limits tab", async ({ page }) => {
   await page.getByLabel("15 minutes before").check();
   await page.getByRole("button", { name: "Save", exact: true }).click();
   await expect.poll(async () => (await (await page.request.get("/api/event-types")).json()).find((e: any) => e.slug === "intro").reminder_offsets).toBe("[1440,60,15]");
+});
+
+// R19: calendar replies arrive at the Worker's email() handler (wrangler dev's local email endpoint).
+const ORG = "bookings@example.com";
+const replyMail = (from: string, uidAt: string, partstat: string) => {
+  const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Google Inc//Google Calendar 70.9054//EN", "METHOD:REPLY", "BEGIN:VEVENT", `UID:${uidAt}`, "SEQUENCE:0",
+    "DTSTAMP:20261115T120000Z", `ORGANIZER;CN=Scheduler:mailto:${ORG}`, `ATTENDEE;PARTSTAT=${partstat};CN=Someone:mailto:${from}`, "END:VEVENT", "END:VCALENDAR", ""].join("\r\n");
+  return [`From: <${from}>`, `To: <${ORG}>`, `Subject: ${partstat}`, "Message-ID: <" + Math.random().toString(16).slice(2) + "@example.com>", "MIME-Version: 1.0",
+    "Content-Type: text/calendar; charset=UTF-8; method=REPLY", "", ics].join("\r\n");
+};
+const deliverMail = (r: APIRequestContext, from: string, raw: string) => r.post(`/cdn-cgi/handler/email?from=${encodeURIComponent(from)}&to=${encodeURIComponent(ORG)}`, { data: raw, headers: { "content-type": "message/rfc822" } });
+
+test("R19 calendar replies update RSVP status, a guest decline emails the host, a host decline asks to cancel", async ({ page, request }) => {
+  const free = flat(await slots(request, "alex", "intro")).filter((s) => s.startsWith("2026-11-23"));
+  const uid = (await (await book(request, "alex", "intro", free[0], { name: "Rae Reply", email: "rae@example.com" })).json()).uid;
+  await expect.poll(async () => (await mailsFor(request, uid)).length).toBe(2);
+  const UID = prop((await mailsFor(request, uid))[0].ics, "UID")!;
+  expect((await deliverMail(request, "alex@example.com", replyMail("alex@example.com", UID, "ACCEPTED"))).ok()).toBe(true);
+  expect((await deliverMail(request, "rae@example.com", replyMail("rae@example.com", UID, "DECLINED"))).ok()).toBe(true);
+  await expect.poll(async () => (await mailsFor(request, uid)).filter((m) => m.subject.startsWith("Declined:")).map((m) => m.recipient)).toEqual(["alex@example.com"]);
+  await login(page);
+  await page.goto("/bookings/upcoming");
+  const row = page.locator(`[data-uid="${uid}"]`);
+  await expect(row.getByRole("list", { name: "Replies" })).toContainText("You Accepted");
+  await expect(row.getByRole("list", { name: "Replies" })).toContainText("Rae Reply Declined");
+  // the host declines their own copy: the booking stays, with a prompt
+  expect((await deliverMail(request, "alex@example.com", replyMail("alex@example.com", UID, "DECLINED").replace("DTSTAMP:20261115T120000Z", "DTSTAMP:20261115T130000Z"))).ok()).toBe(true);
+  await page.reload();
+  await expect(row.getByRole("alert")).toContainText("You declined this in your calendar. Cancel the booking?");
+  await row.getByRole("button", { name: "Keep it" }).click();
+  await expect(row.getByRole("alert")).toHaveCount(0);
+  expect((await (await request.get(`/api/public/bookings/${uid}`)).json()).status).toBe("accepted");
+  // nothing ever goes back to a sender who isn't the host, and the outbox has no reply to the inbound mails
+  expect((await mailsFor(request, uid)).filter((m) => m.recipient === "rae@example.com").length).toBe(1);
 });

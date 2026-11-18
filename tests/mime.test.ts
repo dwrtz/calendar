@@ -54,7 +54,7 @@ describe("R16 invite email (MIME)", () => {
     for (const [k, v] of [["METHOD", "METHOD:REQUEST"], ["STATUS", "STATUS:CONFIRMED"], ["DTSTART", "DTSTART:20261118T063000Z"], ["DTEND", "DTEND:20261118T070000Z"],
       ["UID", "UID:meeting-1@calendar.example.com"], ["SEQUENCE", "SEQUENCE:0"], ["DTSTAMP", "DTSTAMP:20261116T141425Z"]]) expect(prop(hostIcs, k)).toBe(v);
   });
-  it("guest copy and the download keep the host as organizer", () => {
+  it("with no organizer given (email off, the download) the host organizes", () => {
     const g = buildInvite(booking, "request", 0, { ...ctx, audience: "guest" });
     expect(prop(g, "ORGANIZER")).toBe("ORGANIZER;CN=Alex Host:mailto:alex@example.com");
     expect(prop(g, "ATTENDEE;CN=Pat Guest")).toContain("mailto:pat@example.com");

@@ -7,11 +7,15 @@ import {randomHex,HttpError} from "./security";
 import {Router} from "./router";
 import {COLORS} from "../shared/colors";
 import {buildInvite} from "../shared/ics";
-import {makeMailer,emailOn,emailProblem,provider,type Kind} from "./email";
+import {makeMailer,emailOn,emailProblem,provider,organizerFor,type Kind} from "./email";
+import {receiveEmail} from "./inbound";
+import {normAddress} from "../shared/itip";
 import {makeCalendars,FeedError,pollMinutes,USE_BLOCKS_SQL} from "./calendars";
 import {MissingKeyError} from "./crypto";
 import {runScheduled} from "./cron";
 export default { async scheduled(_c: ScheduledController, env: Env, ctx: ExecutionContext) { ctx.waitUntil(runScheduled(env)); },
+ // Calendar replies to the organizer address (R19), routed here by Email Routing.
+ async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) { await receiveEmail(message, env, ctx); },
  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
  const db=database(env, request); const {one,all,run,nowIso}=db;
  const origin=String((env as any).SITE_URL||new URL(request.url).origin).replace(/\/$/,"");
@@ -391,7 +395,7 @@ app.get("/api/public/bookings/:uid/ics", wrap(async (req: any, res: any) => {
     const b = await bookingFull(req.params.uid);
     const ics = buildInvite({ uid: b.uid, icsUid: b.ics_uid, title: b.title, startUtc: b.start_utc, endUtc: b.end_utc, location: b.location, notes: b.notes,
         hostName: b.host_name, hostEmail: b.host_email, bookerName: b.booker_name, bookerEmail: b.booker_email, guests: b.guests },
-        b.status === "cancelled" || b.status === "rejected" ? "cancel" : "publish", b.ics_sequence ?? 0, { origin, appName: settings.appName, now: nowIso(), audience: "guest" });
+        b.status === "cancelled" || b.status === "rejected" ? "cancel" : "publish", b.ics_sequence ?? 0, { origin, appName: settings.appName, now: nowIso(), audience: "guest", organizer: organizerFor(env) });
     res.set({ "Content-Type": "text/calendar; charset=utf-8", "Content-Disposition": `attachment; filename="booking-${b.uid}.ics"` }).send(ics);
 }));
 app.get("/api/bookings", wrap(async (req: any, res: any) => {
@@ -407,7 +411,17 @@ app.get("/api/bookings", wrap(async (req: any, res: any) => {
     const more = items.length > 20;
     if (more)
         items.pop();
-    res.json({ items: items.map((b) => ({ ...b, guests: JSON.parse(b.guests) })), nextCursor: more ? String(offset + 20) : null, counts });
+    // Each participant's calendar reply (R19); "" partstat means no reply yet.
+    const rsvps = items.length ? await all<any>(`SELECT * FROM booking_rsvps WHERE booking_uid IN (${items.map(() => "?").join(",")})`, ...items.map((b) => b.uid)) : [];
+    const withRsvps = items.map((b) => {
+        const guests = JSON.parse(b.guests) as string[], mine = rsvps.filter((r) => r.booking_uid === b.uid);
+        const pick = (email: string) => mine.find((r) => r.email === normAddress(email));
+        const person = (email: string, name: string, role: "host" | "guest") => { const r = pick(email);
+            return { email, name, role, partstat: r?.partstat ?? "", comment: r?.comment ?? "", counterStart: r?.counter_start ?? null, counterEnd: r?.counter_end ?? null }; };
+        const participants = [person(u.email, u.name, "host"), person(b.booker_email, b.booker_name, "guest"), ...guests.filter((g) => g && g !== b.booker_email).map((g) => person(g, g, "guest"))];
+        return { ...b, guests, participants, hostDeclined: mine.some((r) => r.role === "host" && r.host_prompt === 1) };
+    });
+    res.json({ items: withRsvps, nextCursor: more ? String(offset + 20) : null, counts });
 }));
 app.post("/api/bookings/:uid/:action", wrap(async (req: any, res: any) => {
     const u = await need(req), b = await bookingFull(req.params.uid);
@@ -416,6 +430,12 @@ app.post("/api/bookings/:uid/:action", wrap(async (req: any, res: any) => {
     const action = req.params.action;
     if (action === "cancel") {
         res.json(await cancelBooking(b.uid, "host", req.body.reason ?? ""));
+        return;
+    }
+    if (action === "keep") {
+        // The host declined their calendar copy and chose to keep the booking: clear the prompt (R19).
+        await run("UPDATE booking_rsvps SET host_prompt=0 WHERE booking_uid=? AND role='host'", b.uid);
+        res.json(await bookingFull(b.uid));
         return;
     }
     if (!["accept", "decline"].includes(action))

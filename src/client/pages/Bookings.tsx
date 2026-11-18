@@ -11,6 +11,8 @@ const EMPTY: Record<string, [string, string]> = {
   past: ["No past bookings", "Meetings that have ended show up here."], cancelled: ["No cancelled bookings", "Cancelled and declined bookings show up here."],
 };
 
+const RSVP: Record<string, [string, string]> = { ACCEPTED: ["Accepted", "ok"], TENTATIVE: ["Maybe", "warn"], DECLINED: ["Declined", "red"], "NEEDS-ACTION": ["No reply", ""], DELEGATED: ["Delegated", ""] };
+
 function dayHeading(iso: string, tz: string) {
   const d = DateTime.fromISO(iso, { zone: tz }).startOf("day"); const t = DateTime.fromMillis(nowMs(), { zone: tz }).startOf("day");
   const diff = Math.round(d.diff(t, "days").days);
@@ -46,6 +48,22 @@ export function Bookings() {
                     <div className="muted">{b.booker_email}{b.guests.length ? `, ${b.guests.join(", ")}` : ""}</div>
                     {b.location && <div className="muted small">{b.location}</div>}
                     {b.notes && <div className="muted small notes">"{b.notes}"</div>}
+                    {b.participants && (
+                      <ul className="rsvps" aria-label="Replies">
+                        {b.participants.map((p: any) => {
+                          const [label, tone] = RSVP[p.partstat] ?? ["No reply", ""];
+                          return <li key={p.email}><span className="muted small">{p.role === "host" ? "You" : p.name}</span> <span className={`badge ${tone}`}>{label}</span>{p.comment && <span className="muted small"> "{p.comment}"</span>}
+                            {p.counterStart && <span className="muted small"> proposed {dayHeading(p.counterStart, tz)} {fmtTime(p.counterStart, tz, f)} - {fmtTime(p.counterEnd, tz, f)} (not applied)</span>}</li>;
+                        })}
+                      </ul>
+                    )}
+                    {b.hostDeclined && status === "upcoming" && (
+                      <div className="notice" role="alert">
+                        You declined this in your calendar. Cancel the booking?{" "}
+                        <button className="btn danger-fill" onClick={() => { setReason(""); setDialog({ kind: "cancel", b }); }}>Cancel booking</button>{" "}
+                        <button className="btn" onClick={() => act(`/api/bookings/${b.uid}/keep`)}>Keep it</button>
+                      </div>
+                    )}
                     <div className="badges">
                       {b.status === "pending" && <span className="badge warn">Needs approval</span>}
                       {b.from_uid && <span className="badge">Moved</span>}
