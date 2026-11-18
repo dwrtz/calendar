@@ -8,7 +8,7 @@ import {Router} from "./router";
 import {COLORS} from "../shared/colors";
 import {buildInvite} from "../shared/ics";
 import {makeMailer,emailOn,emailProblem,provider,organizerFor,type Kind} from "./email";
-import {receiveEmail} from "./inbound";
+import {receiveEmail} from "./email-handler";
 import {normAddress} from "../shared/itip";
 import {makeCalendars,FeedError,pollMinutes,USE_BLOCKS_SQL} from "./calendars";
 import {MissingKeyError} from "./crypto";

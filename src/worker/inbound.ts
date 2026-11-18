@@ -3,8 +3,7 @@
 import PostalMime from "postal-mime";
 import { parseItip, splitUid, normAddress, type Itip } from "../shared/itip";
 export { normAddress };
-import { organizerFor, emailOn, makeMailer, mask } from "./email";
-import { database } from "./db";
+import { organizerFor } from "./email";
 
 type Db = { one: (sql: string, ...p: any[]) => Promise<any>; all: (sql: string, ...p: any[]) => Promise<any[]>; run: (sql: string, ...p: any[]) => Promise<{ changes: number }>; nowIso: () => string };
 export type InboundMail = { from: string; to: string; raw: ArrayBuffer | Uint8Array | string; size?: number };
@@ -118,20 +117,4 @@ export async function processInbound(m: InboundMail, deps: { env: any; db: Db; n
     await deps.notifyDeclined(b.uid, row.id); notified = true;
   }
   return { ok: true, action: "updated", uid: b.uid, email: key, partstat, role, notified, prompt: !!prompt };
-}
-
-/** The Worker's email() handler. Rejects (permanent SMTP error) anything it can't use; never forwards or replies. */
-export async function receiveEmail(message: ForwardableEmailMessage, env: any, ctx?: ExecutionContext) {
-  const raw = await new Response(message.raw).arrayBuffer();
-  const db = database(env, new Request("https://email.invalid/"));
-  const origin = String(env.SITE_URL || "").replace(/\/$/, "");
-  const mailer = makeMailer(env, db, origin);
-  const result = emailOn(env) && origin
-    ? await processInbound({ from: message.from, to: message.to, raw, size: message.rawSize }, {
-        env, db, notifyDeclined: async (uid, id) => { const p = mailer.notifyHost("rsvp_declined", uid, id); if (ctx?.waitUntil) ctx.waitUntil(p); else await p; },
-      })
-    : { ok: false as const, reason: REJECT.off };
-  console.log(JSON.stringify({ inbound: result.ok ? result.action : "rejected", from: mask(message.from), ...(result.ok ? { uid: result.uid, role: result.role, partstat: result.partstat ?? "" } : { reason: result.reason }) }));
-  if (!result.ok) message.setReject(result.reason);
-  return result;
 }

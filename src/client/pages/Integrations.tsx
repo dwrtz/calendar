@@ -67,6 +67,7 @@ export function Integrations() {
   const rows = [
     { name: "Email", state: e.state, line: e.state === "off" ? "No emails are sent. Guests are told to keep their booking page." : e.state === "attention" ? e.reason : e.provider === "test" ? "Sending to the test outbox." : `Sending from ${e.from} with ${e.provider === "cloudflare" ? "Cloudflare Email Sending" : "Resend"}.`, err: e.lastError },
     { name: "Calendar invites", state: e.state === "on" ? "on" : "off", line: e.state === "on" ? "Booking emails carry an invite that shows as confirmed in the guest's and your calendar." : "Sent with booking emails, so they start when email does. \"Add to calendar\" works without email." },
+    { name: "Calendar replies", state: e.state === "on" ? "on" : "off", line: e.state === "on" ? `Replies to ${e.provider === "test" ? "the sending address" : e.from} update each person's status on the booking. That address must receive mail: Cloudflare Email Routing on its domain, with a rule sending it to this Worker. The cf-bounce MX from Email Sending doesn't count.` : "Start with email. Invites name your sending address as organizer, so it must then receive calendar replies." },
     { name: "Busy times (iCal)", state: d.ical?.state, line: d.ical?.state === "off" ? "Paste a secret iCal address under Calendars." : `Last synced ${ago(d.ical?.lastSyncAt)}.`, err: d.ical?.lastError },
     { name: "Google Calendar", state: "off", line: "Not set up on this site." },
   ];
@@ -80,6 +81,7 @@ export function Integrations() {
           <li>In the dashboard open Compute &gt; Email Service &gt; Email Sending &gt; Onboard Domain and pick your domain. It adds SPF and DKIM TXT records, a DMARC record on _dmarc and cf-bounce MX records. Wait until it shows as verified.</li>
           <li>Add the <code>send_email</code> binding named <code>EMAIL</code>, set <code>EMAIL_PROVIDER=cloudflare</code>, <code>EMAIL_FROM</code> (an address on that domain) and <code>SITE_URL</code>, then deploy.</li>
           <li>Or use Resend: verify the domain there, <code>wrangler secret put RESEND_API_KEY</code>, set <code>EMAIL_PROVIDER=resend</code> and <code>EMAIL_FROM</code>.</li>
+          <li>Required either way: make the <code>EMAIL_FROM</code> address receive calendar replies. Its cf-bounce MX records only take bounces. Open Compute &gt; Email Service &gt; Email Routing, enable it for the domain or subdomain after the <code>@</code> in <code>EMAIL_FROM</code> (for a subdomain: the apex domain &gt; Settings &gt; Subdomains), then add a routing rule that sends that exact address to this Worker.</li>
         </ol></details>}
     </div>
   );
