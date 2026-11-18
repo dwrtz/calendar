@@ -58,8 +58,10 @@ async function slotsFor(et: any, rangeStart: string, rangeEnd: string, excludeUi
         start: b.start_utc, end: b.end_utc, bufferBeforeMin: b.buffer_before_min, bufferAfterMin: b.buffer_after_min, sameEvent: b.event_type_id === et.id,
     }));
     // Busy times from the host's calendar feed (R17) count like bookings with no buffers of their own.
-    const blocks = await all<any>(`SELECT start_ms,end_ms FROM busy_blocks bb WHERE bb.user_id=? AND bb.end_ms > ? AND bb.start_ms < ? AND ${USE_BLOCKS_SQL}`,
-        et.user_id, Date.parse(from), Date.parse(to), staleCutoff());
+    // Proposed new times (R19) are held as 'hold:{uid}' blocks; a booking's own hold never blocks its own move.
+    const blocks = await all<any>(`SELECT start_ms,end_ms FROM busy_blocks bb WHERE bb.user_id=? AND bb.end_ms > ? AND bb.start_ms < ?
+     AND bb.source IS NOT ? AND (bb.source LIKE 'hold:%' OR ${USE_BLOCKS_SQL})`,
+        et.user_id, Date.parse(from), Date.parse(to), `hold:${excludeUid ?? ""}`, staleCutoff());
     for (const k of blocks) busy.push({ start: new Date(k.start_ms).toISOString(), end: new Date(k.end_ms).toISOString(), bufferBeforeMin: 0, bufferAfterMin: 0, sameEvent: false });
     return computeSlots({
         now: nowIso(), rangeStart, rangeEnd,

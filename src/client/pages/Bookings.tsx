@@ -52,16 +52,14 @@ export function Bookings() {
                       <ul className="rsvps" aria-label="Replies">
                         {b.participants.map((p: any) => {
                           const [label, tone] = RSVP[p.partstat] ?? ["No reply", ""];
-                          return <li key={p.email}><span className="muted small">{p.role === "host" ? "You" : p.name}</span> <span className={`badge ${tone}`}>{label}</span>{p.comment && <span className="muted small"> "{p.comment}"</span>}
-                            {p.counterStart && <span className="muted small"> proposed {dayHeading(p.counterStart, tz)} {fmtTime(p.counterStart, tz, f)} - {fmtTime(p.counterEnd, tz, f)} (not applied)</span>}</li>;
+                          return <li key={p.email}><span className="muted small">{p.role === "host" ? "You" : p.name}</span> <span className={`badge ${tone}`}>{label}</span>{p.comment && <span className="muted small"> "{p.comment}"</span>}</li>;
                         })}
                       </ul>
                     )}
-                    {b.hostDeclined && status === "upcoming" && (
-                      <div className="notice" role="alert">
-                        You declined this in your calendar. Cancel the booking?{" "}
-                        <button className="btn danger-fill" onClick={() => { setReason(""); setDialog({ kind: "cancel", b }); }}>Cancel booking</button>{" "}
-                        <button className="btn" onClick={() => act(`/api/bookings/${b.uid}/keep`)}>Keep it</button>
+                    {b.pendingChange && status === "upcoming" && (
+                      <div className="notice" role="status">
+                        {b.pendingChange.proposerRole === "host" ? "You" : b.pendingChange.proposerName} proposed a new time: {dayHeading(b.pendingChange.start, tz)} {fmtTime(b.pendingChange.start, tz, f)} - {fmtTime(b.pendingChange.end, tz, f)}.
+                        {" "}Waiting for {b.pendingChange.proposerRole === "host" ? b.pendingChange.counterpartName : "you"} to accept or decline it in {b.pendingChange.proposerRole === "host" ? "their" : "your"} calendar. Both times are held until then.
                       </div>
                     )}
                     <div className="badges">

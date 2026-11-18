@@ -3,7 +3,7 @@
 // Gmail renders the invite card and adds the event from the inline text/calendar part.
 export type MimeInput = {
   from: { email: string; name?: string }; to: string; replyTo?: string; subject: string; text: string; html: string;
-  ics?: string; icsMethod?: "REQUEST" | "CANCEL" | "PUBLISH"; date?: Date; messageId?: string;
+  ics?: string; icsMethod?: "REQUEST" | "CANCEL" | "PUBLISH" | "DECLINECOUNTER"; date?: Date; messageId?: string;
 };
 const enc = new TextEncoder();
 export function b64(s: string): string { let o = ""; for (const x of enc.encode(s)) o += String.fromCharCode(x); return btoa(o); }

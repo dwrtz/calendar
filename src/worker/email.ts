@@ -1,14 +1,15 @@
 // Email (R15) and invite attachments (R16). Off unless EMAIL_PROVIDER is set.
 import { DateTime } from "luxon";
 import { settings } from "../shared/settings";
-import { buildInvite, type InviteKind } from "../shared/ics";
+import { buildDeclineCounter, buildInvite, type InviteKind } from "../shared/ics";
 import { b64, buildMime } from "./mime";
 import { normAddress } from "../shared/itip";
 
 export type Mail = { from: string; to: string; replyTo?: string; subject: string; text: string; html: string;
-  ics?: string; icsMethod?: "REQUEST" | "CANCEL" };
+  ics?: string; icsMethod?: "REQUEST" | "CANCEL" | "DECLINECOUNTER" };
 export type Sender = { name: string; send(m: Mail): Promise<void> };
-export type Kind = "confirmed" | "requested" | "accepted" | "declined" | "moved" | "cancelled" | "reminder" | "rsvp_declined";
+export type Kind = "confirmed" | "requested" | "accepted" | "declined" | "moved" | "cancelled" | "reminder" | "rsvp_declined"
+  | "change_proposed" | "change_confirmed" | "change_expired" | "counter_declined";
 type Db = { one: (sql: string, ...p: any[]) => Promise<any>; all: (sql: string, ...p: any[]) => Promise<any[]>; run: (sql: string, ...p: any[]) => Promise<{ changes: number }>; nowIso: () => string };
 
 export const mask = (to: string) => String(to).replace(/^(.).*(@.*)$/, "$1***$2");
@@ -84,7 +85,10 @@ export type MailBooking = { uid: string; title: string; start_utc: string; end_u
   booker_name: string; booker_email: string; booker_tz: string; guests: string[]; host_name: string; host_email: string; host_tz: string;
   cancel_reason?: string; cancelled_by?: string | null; reschedule_reason?: string; ics_uid?: string | null; ics_sequence?: number;
   /** For rsvp_declined: who declined in their calendar (R19). */
-  decliner?: { name: string; email: string; comment?: string } };
+  decliner?: { name: string; email: string; comment?: string };
+  /** For change_* and counter_declined: the proposed new time (R19). Times are the proposal's; from_* the original. */
+  change?: { proposer_name: string; proposer_email: string; counterpart_name: string; start_utc: string | null; end_utc: string | null;
+    from_start_utc: string; from_end_utc: string; reason: string; comment: string; sequence: number } };
 
 /** Subject, plain text and HTML for one recipient. */
 export function render(kind: Kind, b: MailBooking, audience: "guest" | "host", origin: string, offsetMin = 0) {
@@ -98,7 +102,11 @@ export function render(kind: Kind, b: MailBooking, audience: "guest" | "host", o
     requested: audience === "host" ? `New request: ${tail}` : `Request received: ${tail}`, declined: `Declined: ${tail}`,
     reminder: `Reminder: ${b.title} with ${other} starts in ${offsetText(offsetMin)}`,
     rsvp_declined: `Declined: ${b.title} with ${b.decliner?.name || other} on ${w.short}`,
+    change_proposed: `New time proposed: ${tail}`, change_confirmed: `Moved: ${tail}`, change_expired: `Unchanged: ${tail}`,
+    counter_declined: `New time not available: ${tail}`,
   };
+  const c = b.change;
+  const at = (s?: string | null, e?: string | null) => (s && e ? ((x) => `${x.day}, ${x.range}`)(when(s, e, zone)) : "the time you proposed");
   const by = b.cancelled_by === "host" ? b.host_name : b.booker_name;
   const lead: Record<Kind, string> = {
     confirmed: audience === "host" ? `${b.booker_name} booked a meeting with you.` : `Your meeting with ${b.host_name} is confirmed.`,
@@ -109,6 +117,10 @@ export function render(kind: Kind, b: MailBooking, audience: "guest" | "host", o
     cancelled: `${by} cancelled this meeting.${b.cancel_reason ? ` Reason: ${b.cancel_reason}` : ""}`,
     reminder: `Your meeting starts in ${offsetText(offsetMin)}.`,
     rsvp_declined: `${b.decliner?.name || "A guest"} declined this meeting in their calendar.${b.decliner?.comment ? ` Note: ${b.decliner.comment}` : ""} The booking is still on: cancel or reschedule it from your bookings if it isn't happening.`,
+    change_proposed: `${c?.proposer_name || other} proposed a new time: ${at(c?.start_utc, c?.end_utc)} (it was ${at(c?.from_start_utc, c?.from_end_utc)}).${c?.comment ? ` Note: ${c.comment}` : ""} Accept or decline it in your calendar. Accepting moves the meeting; declining cancels it. Until then the original time stays booked.`,
+    change_confirmed: `This meeting moved to ${w.day}, ${w.range}, the new time ${c?.proposer_name || "a participant"} proposed and ${c?.counterpart_name || "the other party"} accepted. The old time is cancelled.`,
+    change_expired: `The proposed new time (${at(c?.start_utc, c?.end_utc)}) wasn't accepted in time, so this meeting stays at its original time.`,
+    counter_declined: `Your proposed new time (${at(c?.start_utc, c?.end_utc)}) didn't go through. ${c?.reason || "That time isn't available."} The meeting stays at ${w.day}, ${w.range}. Pick another time in your calendar or on the booking page.`,
   };
   const isLink = /^https?:\/\//i.test(b.location);
   const rows: [string, string][] = [["What", b.title], ["When", `${w.day}\n${w.range}`], ["Who", `${b.host_name} (host)\n${b.booker_name} <${b.booker_email}>${b.guests?.length ? "\n" + b.guests.join("\n") : ""}`]];
@@ -129,7 +141,7 @@ export function render(kind: Kind, b: MailBooking, audience: "guest" | "host", o
 /** Which invite (if any) goes with an email. Pending requests and declines get none. */
 function inviteKind(kind: Kind, b: MailBooking): InviteKind | null {
   if (kind === "cancelled") return b.cancelled_by === "host" || b.cancelled_by === "guest" ? "cancel" : null;
-  if (["confirmed", "accepted", "moved"].includes(kind) && b.status === "accepted") return "request";
+  if (["confirmed", "accepted", "moved", "change_proposed", "change_confirmed", "change_expired"].includes(kind) && b.status === "accepted") return "request";
   return null;
 }
 
@@ -165,13 +177,28 @@ export function makeMailer(env: any, db: Db, origin: string) {
         if (!r) throw new Error("RSVP row not found");
         b = { ...b, decliner: { email: r.email, name: r.email === normAddress(b.booker_email) ? b.booker_name : r.name || r.email, comment: r.comment } };
       }
-      const r = render(kind, b, audience, origin, offset);
+      let needsAction = "", declineCounter = false;
+      if (kind.startsWith("change_") || kind === "counter_declined") {
+        // offset_min holds the booking_changes row id, so a retry rebuilds the same email.
+        const ch = await db.one("SELECT * FROM booking_changes WHERE id=? AND booking_uid=?", offset, b.uid);
+        if (!ch) throw new Error("Change row not found");
+        b = { ...b, change: ch };
+        if (kind === "change_proposed") {
+          // The other party sees the proposed time, at the proposal's SEQUENCE, with an answer requested of them.
+          b = { ...b, start_utc: ch.start_utc, end_utc: ch.end_utc, ics_sequence: ch.sequence };
+          needsAction = to;
+        }
+        declineCounter = kind === "counter_declined";
+      }
+      const r = render(kind, b, audience, origin, kind === "reminder" ? offset : 0);
       const ik = noInvite ? null : inviteKind(kind, b);
-      const ics = ik ? buildInvite({ uid: b.uid, icsUid: b.ics_uid, title: b.title, startUtc: b.start_utc, endUtc: b.end_utc, location: b.location, notes: b.notes,
+      const ics = declineCounter ? buildDeclineCounter({ uid: b.uid, icsUid: b.ics_uid, title: b.title, startUtc: b.start_utc, endUtc: b.end_utc },
+        b.ics_sequence ?? 0, { origin, now: db.nowIso(), organizer, attendee: { email: to, name: b.change?.proposer_name || "" }, comment: b.change?.reason || "" })
+        : ik ? buildInvite({ uid: b.uid, icsUid: b.ics_uid, title: b.title, startUtc: b.start_utc, endUtc: b.end_utc, location: b.location, notes: b.notes,
         hostName: b.host_name, hostEmail: b.host_email, bookerName: b.booker_name, bookerEmail: b.booker_email, guests: b.guests }, ik, b.ics_sequence ?? 0,
-        { origin, appName: settings.appName, now: db.nowIso(), audience, organizer }) : null;
+        { origin, appName: settings.appName, now: db.nowIso(), audience, organizer, needsAction }) : null;
       await sender.send({ from, to, replyTo: audience === "guest" ? b.host_email : b.booker_email, ...r,
-        ics: ics ?? undefined, icsMethod: ik === "cancel" ? "CANCEL" : "REQUEST" });
+        ics: ics ?? undefined, icsMethod: declineCounter ? "DECLINECOUNTER" : ik === "cancel" ? "CANCEL" : "REQUEST" });
       await db.run("UPDATE email_log SET status='sent',sent_at=?,error='' WHERE booking_uid=? AND kind=? AND offset_min=? AND recipient=?", db.nowIso(), b.uid, kind, offset, to);
     } catch (e: any) {
       const msg = String(e?.message ?? e).slice(0, 300);
@@ -180,10 +207,10 @@ export function makeMailer(env: any, db: Db, origin: string) {
     }
   }
   /** Email every recipient about a booking change. Never throws. */
-  async function notify(kind: Kind, uid: string, opts: { noInvite?: boolean } = {}) {
+  async function notify(kind: Kind, uid: string, opts: { noInvite?: boolean; offset?: number } = {}) {
     try {
       const b = await load(uid); if (!b) return;
-      for (const r of recipients(b)) await deliver(kind, b, r.to, r.audience, 0, !!opts.noInvite);
+      for (const r of recipients(b)) await deliver(kind, b, r.to, r.audience, opts.offset ?? 0, !!opts.noInvite);
     } catch (e: any) { console.error(JSON.stringify({ mail: "notify failed", kind, error: String(e?.message ?? e) })); }
   }
   /** Email only the host, for example when a guest declines in their calendar (R19). Never throws. */
@@ -192,6 +219,13 @@ export function makeMailer(env: any, db: Db, origin: string) {
       const b = await load(uid); if (!b) return;
       await deliver(kind, b, b.host_email, "host", offset, true);
     } catch (e: any) { console.error(JSON.stringify({ mail: "notifyHost failed", kind, error: String(e?.message ?? e) })); }
+  }
+  /** Email one person (R19: a proposed time goes to the other party, a refusal to the proposer). Never throws. */
+  async function notifyOne(kind: Kind, uid: string, to: string, audience: "host" | "guest", offset: number) {
+    try {
+      const b = await load(uid); if (!b) return;
+      await deliver(kind, b, to, audience, offset);
+    } catch (e: any) { console.error(JSON.stringify({ mail: "notifyOne failed", kind, error: String(e?.message ?? e) })); }
   }
   /** Cron: reminders whose send time fell in the last `windowMin` minutes (and after the booking was made), and retries. */
   async function runReminders(windowMin = 15) {
@@ -218,5 +252,5 @@ export function makeMailer(env: any, db: Db, origin: string) {
     }
     return { reminders, retried: failed.length };
   }
-  return { notify, notifyHost, runReminders, sender };
+  return { notify, notifyHost, notifyOne, runReminders, sender };
 }

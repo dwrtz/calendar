@@ -4,11 +4,13 @@ import PostalMime from "postal-mime";
 import { parseItip, splitUid, normAddress, type Itip } from "../shared/itip";
 export { normAddress };
 import { organizerFor } from "./email";
+import { acceptChange, cancelForDecline, declineChange, expireDue, pendingChange, proposeChange, type ChangeMailer, type Party } from "./changes";
 
 type Db = { one: (sql: string, ...p: any[]) => Promise<any>; all: (sql: string, ...p: any[]) => Promise<any[]>; run: (sql: string, ...p: any[]) => Promise<{ changes: number }>; nowIso: () => string };
 export type InboundMail = { from: string; to: string; raw: ArrayBuffer | Uint8Array | string; size?: number };
+export type InboundAction = "updated" | "stale" | "cancelled" | "change_proposed" | "counter_declined" | "change_accepted" | "change_declined" | "duplicate" | "ignored";
 export type InboundResult =
-  | { ok: true; action: "updated" | "counter" | "stale"; uid: string; email: string; partstat?: string; role: "host" | "guest"; notified?: boolean; prompt?: boolean }
+  | { ok: true; action: InboundAction; uid: string; email: string; partstat?: string; role: "host" | "guest"; party?: boolean; reason?: string }
   | { ok: false; reason: string };
 export const MAX_INBOUND_BYTES = 1_000_000;
 export const REJECT = {
@@ -20,6 +22,7 @@ export const REJECT = {
   unknown: "Unknown event",
   attendee: "The reply's attendee is not on this event",
   sender: "The sender does not match the reply's attendee",
+  loop: "Mail from the organizer address is not processed",
 } as const;
 
 /** Envelope senders that calendar services use for replies they send on a person's behalf. */
@@ -54,12 +57,18 @@ export async function calendarParts(raw: InboundMail["raw"]): Promise<{ parts: s
   return { parts, from: parsed.from?.address ?? "" };
 }
 
-/** Validate one inbound message and apply it. Pure apart from `db` and `notifyDeclined`; never sends to the sender. */
-export async function processInbound(m: InboundMail, deps: { env: any; db: Db; notifyDeclined: (uid: string, rsvpId: number) => Promise<void> }): Promise<InboundResult> {
-  const { env, db } = deps;
+export type InboundDeps = { env: any; db: Db; mailer: ChangeMailer; slotFree: (b: any, startUtc: string) => Promise<boolean> };
+/**
+ * Validate one inbound message and apply it (R19). Never answers a reply with a reply: the only mail it causes is the
+ * organizer's own REQUEST, CANCEL or DECLINECOUNTER, through the normal outbound path.
+ */
+export async function processInbound(m: InboundMail, deps: InboundDeps): Promise<InboundResult> {
+  const { env, db, mailer } = deps;
   const org = organizerFor(env);
   if (!org) return { ok: false, reason: REJECT.off };
   if (normAddress(m.to) !== normAddress(org.email)) return { ok: false, reason: REJECT.mailbox };
+  // Loop guard: mail from the organizer address itself is never processed.
+  if (normAddress(m.from) === normAddress(org.email)) return { ok: false, reason: REJECT.loop };
   const size = m.size ?? (typeof m.raw === "string" ? m.raw.length : m.raw.byteLength);
   if (size > MAX_INBOUND_BYTES) return { ok: false, reason: REJECT.big };
   let found: { parts: string[]; from: string };
@@ -68,12 +77,13 @@ export async function processInbound(m: InboundMail, deps: { env: any; db: Db; n
   if (!itips.length) return { ok: false, reason: REJECT.notCalendar };
   const it = itips.find((x) => x.method === "REPLY" || x.method === "COUNTER");
   if (!it) return { ok: false, reason: REJECT.method };
+  if (normAddress(found.from) === normAddress(org.email)) return { ok: false, reason: REJECT.loop };
 
   // Match the UID to a booking: "{first booking uid}@{site host}" (R16). A moved booking shares the first one's UID.
   const { id, host } = splitUid(it.uid);
   const siteHost = (() => { try { return new URL(String(env.SITE_URL || "")).hostname.toLowerCase(); } catch { return ""; } })();
   if (!id || (siteHost && host !== siteHost)) return { ok: false, reason: REJECT.unknown };
-  const b = await db.one(`SELECT b.*,u.email AS host_email FROM bookings b JOIN users u ON u.id=b.host_id
+  const b = await db.one(`SELECT b.*,u.email AS host_email,u.name AS host_name FROM bookings b JOIN users u ON u.id=b.host_id
     WHERE b.ics_uid=?1 OR b.uid=?1 ORDER BY (b.status IN ('accepted','pending')) DESC, b.id DESC LIMIT 1`, id);
   if (!b) return { ok: false, reason: REJECT.unknown };
 
@@ -92,29 +102,44 @@ export async function processInbound(m: InboundMail, deps: { env: any; db: Db; n
   const stale = it.sequence < (b.ics_sequence ?? 0) || (prev && (prev.sequence > it.sequence || (prev.sequence === it.sequence && prev.dtstamp && it.dtstamp && prev.dtstamp > it.dtstamp)));
   if (stale) return { ok: true, action: "stale", uid: b.uid, email: key, role };
   const now = db.nowIso();
+  // Pending proposals whose time is up resolve first, so a late answer can't move the meeting.
+  await expireDue(db, mailer, b.uid);
   const live = b.status === "accepted" && b.end_utc > now;
   const name = (a.name || "").slice(0, 200);
+  // The parties are the host and the person who booked; other guests' answers are recorded only.
+  const isBooker = normAddress(b.booker_email) === key;
+  const party = role === "host" || isBooker;
+  // Mail goes to the addresses on the booking (normAddress is for matching only).
+  const me: Party = { email: role === "host" ? b.host_email : isBooker ? b.booker_email : a.email, name: (role === "host" ? b.host_name : isBooker ? b.booker_name : "") || name, role };
+  const other: Party | null = !party ? null : role === "host"
+    ? { email: b.booker_email, name: b.booker_name || "", role: "guest" }
+    : { email: b.host_email, name: b.host_name || "", role: "host" };
+  const base = { ok: true as const, uid: b.uid, email: key, role, party };
 
   if (it.method === "COUNTER") {
-    // A proposed new time is shown to the host only; nothing is moved (R19).
-    await db.run(`INSERT INTO booking_rsvps (booking_uid,email,name,role,partstat,sequence,dtstamp,comment,counter_start,counter_end,counter_at,host_prompt,updated_at)
-      VALUES (?,?,?,?,'',?,?,?,?,?,?,0,?) ON CONFLICT(booking_uid,email) DO UPDATE SET name=excluded.name,sequence=excluded.sequence,dtstamp=excluded.dtstamp,
-      comment=excluded.comment,counter_start=excluded.counter_start,counter_end=excluded.counter_end,counter_at=excluded.counter_at,updated_at=excluded.updated_at`,
-      b.uid, key, name, role, it.sequence, it.dtstamp, it.comment, it.proposed?.startUtc ?? null, it.proposed?.endUtc ?? null, now, now);
-    return { ok: true, action: "counter", uid: b.uid, email: key, role };
+    if (!live) return { ...base, action: "ignored", reason: "The booking is not live" };
+    const r = await proposeChange(db, mailer, b, me, other, it.proposed, (it.comment || "").slice(0, 1000), deps.slotFree);
+    return { ...base, action: r.action, reason: r.reason };
   }
 
   const partstat = ["ACCEPTED", "TENTATIVE", "DECLINED", "NEEDS-ACTION", "DELEGATED"].includes(a.partstat) ? a.partstat : "NEEDS-ACTION";
-  // The host declining their own copy flags the booking with a "cancel it?" prompt; it is never cancelled for them.
-  const prompt = role === "host" && partstat === "DECLINED" && live ? 1 : 0;
   await db.run(`INSERT INTO booking_rsvps (booking_uid,email,name,role,partstat,sequence,dtstamp,comment,host_prompt,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(booking_uid,email) DO UPDATE SET name=excluded.name,role=excluded.role,partstat=excluded.partstat,
-    sequence=excluded.sequence,dtstamp=excluded.dtstamp,comment=excluded.comment,host_prompt=excluded.host_prompt,updated_at=excluded.updated_at`,
-    b.uid, key, name, role, partstat, it.sequence, it.dtstamp, it.comment, prompt, now);
-  let notified = false;
-  if (role === "guest" && partstat === "DECLINED" && prev?.partstat !== "DECLINED" && live) {
-    const row = await db.one("SELECT id FROM booking_rsvps WHERE booking_uid=? AND email=?", b.uid, key);
-    await deps.notifyDeclined(b.uid, row.id); notified = true;
+    VALUES (?,?,?,?,?,?,?,?,0,?) ON CONFLICT(booking_uid,email) DO UPDATE SET name=excluded.name,role=excluded.role,partstat=excluded.partstat,
+    sequence=excluded.sequence,dtstamp=excluded.dtstamp,comment=excluded.comment,updated_at=excluded.updated_at`,
+    b.uid, key, name, role, partstat, it.sequence, it.dtstamp, it.comment, now);
+  if (!live) return { ...base, action: "updated", partstat };
+
+  // An answer to a pending proposed time, from the party it was sent to, at that proposal's SEQUENCE or later.
+  const ch = await pendingChange(db, b.uid);
+  if (ch && normAddress(ch.counterpart_email) === key && it.sequence >= ch.sequence) {
+    if (partstat === "ACCEPTED" && await acceptChange(db, mailer, b, ch)) return { ...base, action: "change_accepted", partstat };
+    if (partstat === "DECLINED" && await declineChange(db, mailer, b, ch, role)) return { ...base, action: "change_declined", partstat };
+    return { ...base, action: "updated", partstat };
   }
-  return { ok: true, action: "updated", uid: b.uid, email: key, partstat, role, notified, prompt: !!prompt };
+  // A party declining the meeting cancels it for everyone.
+  if (partstat === "DECLINED" && party) {
+    const reason = "Declined in their calendar" + (it.comment ? `: ${it.comment.slice(0, 500)}` : "");
+    if (await cancelForDecline(db, mailer, b, role, reason)) return { ...base, action: "cancelled", partstat };
+  }
+  return { ...base, action: "updated", partstat };
 }

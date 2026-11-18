@@ -110,12 +110,19 @@ Setup (Cloudflare Email Routing, free, needs the domain on Cloudflare DNS):
 
 The Worker's `email()` handler reads each message's `text/calendar` part (iTIP `METHOD:REPLY` or `COUNTER`), matches its `UID` to a booking, and accepts it only when the replying `ATTENDEE` is on that booking and the SMTP sender is that attendee (or the attendee's calendar service, such as Google Calendar's bounce address, with the attendee in `From`). Anything else is rejected with a permanent SMTP error; nothing is forwarded and nothing is ever sent back to the sender.
 
-- Accepted and maybe update that person's status in your bookings list, with no email.
-- A guest's decline emails you (with a link to the booking). The booking is not cancelled.
-- If you decline your own copy, the booking shows "You declined this in your calendar. Cancel the booking?" with "Cancel booking" and "Keep it". It is never cancelled for you.
-- A proposed new time is shown on the booking for you; nothing is moved.
+Nobody has to sign in to follow or change a meeting: their calendar shows its state, and the app sends every update.
 
-`migrations/0002_integrations.sql` adds the tables and columns these need; `migrations/0004_rsvp.sql` adds `booking_rsvps` for calendar replies. They only add; apply them with `npx wrangler d1 migrations apply DB --remote`.
+- **Accepted / maybe:** that person's status updates in your bookings list. No email.
+- **Declined** by you or by the person who booked: the booking is cancelled, the time is freed, and everyone (the decliner's own copy included) gets the standard calendar cancellation (`METHOD:CANCEL`) with a short note. A decline from an extra guest only updates their status.
+- **Proposed new time** (Google Calendar's "Propose a new time", iTIP `COUNTER`) by you or by the person who booked:
+  - If the time isn't bookable (outside your hours, taken, a different length, in the past), the proposer gets a `DECLINECOUNTER` with a one-line reason and nothing changes.
+  - Otherwise the other party gets an updated invite at the new time that asks them to answer (`PARTSTAT=NEEDS-ACTION;RSVP=TRUE`), with the proposed time and the booking link in the email. Both the original and the proposed time stay held.
+  - They accept: the meeting moves, the original time is freed, and everyone gets the final invite. Reminders follow the new time.
+  - They decline: the meeting is cancelled for everyone.
+  - Nobody answers by the earlier of the two start times: the proposal expires, the original time stands, and everyone gets the invite again at that time.
+- Replies older than the current invite (lower `SEQUENCE`, or an earlier `DTSTAMP` than one already recorded) change nothing. Mail from the organizer address itself is refused, and the app never answers a reply with a reply.
+
+`migrations/0002_integrations.sql` adds the tables and columns these need; `migrations/0004_rsvp.sql` adds `booking_rsvps` for calendar replies; `migrations/0005_booking_changes.sql` adds `booking_changes` for proposed new times. They only add; apply them with `npx wrangler d1 migrations apply DB --remote`.
 
 ## Settings (`spekkr.inputs.json`)
 

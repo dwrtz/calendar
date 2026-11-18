@@ -158,34 +158,93 @@ test("R15 event reminders are editable on the Limits tab", async ({ page }) => {
 
 // R19: calendar replies arrive at the Worker's email() handler (wrangler dev's local email endpoint).
 const ORG = "bookings@example.com";
-const replyMail = (from: string, uidAt: string, partstat: string) => {
-  const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Google Inc//Google Calendar 70.9054//EN", "METHOD:REPLY", "BEGIN:VEVENT", `UID:${uidAt}`, "SEQUENCE:0",
-    "DTSTAMP:20261115T120000Z", `ORGANIZER;CN=Scheduler:mailto:${ORG}`, `ATTENDEE;PARTSTAT=${partstat};CN=Someone:mailto:${from}`, "END:VEVENT", "END:VCALENDAR", ""].join("\r\n");
-  return [`From: <${from}>`, `To: <${ORG}>`, `Subject: ${partstat}`, "Message-ID: <" + Math.random().toString(16).slice(2) + "@example.com>", "MIME-Version: 1.0",
-    "Content-Type: text/calendar; charset=UTF-8; method=REPLY", "", ics].join("\r\n");
+const icsTime = (iso: string) => iso.replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+const plus = (iso: string, min: number) => new Date(Date.parse(iso) + min * 60000).toISOString();
+/** A Google-style iTIP message (REPLY or COUNTER) from one attendee, as one text/calendar body. */
+const itipMail = (from: string, uidAt: string, method: "REPLY" | "COUNTER", partstat: string, o: { seq?: number; start?: string; stamp?: string } = {}) => {
+  const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Google Inc//Google Calendar 70.9054//EN", `METHOD:${method}`, "BEGIN:VEVENT", `UID:${uidAt}`, `SEQUENCE:${o.seq ?? 0}`,
+    `DTSTAMP:${o.stamp ?? "20261115T120000Z"}`, ...(o.start ? [`DTSTART:${icsTime(o.start)}`, `DTEND:${icsTime(plus(o.start, 30))}`] : []),
+    `ORGANIZER;CN=Scheduler:mailto:${ORG}`, `ATTENDEE;PARTSTAT=${partstat};CN=Someone:mailto:${from}`, "END:VEVENT", "END:VCALENDAR", ""].join("\r\n");
+  return [`From: <${from}>`, `To: <${ORG}>`, `Subject: ${method} ${partstat}`, "Message-ID: <" + Math.random().toString(16).slice(2) + "@example.com>", "MIME-Version: 1.0",
+    `Content-Type: text/calendar; charset=UTF-8; method=${method}`, "", ics].join("\r\n");
 };
+const replyMail = (from: string, uidAt: string, partstat: string, seq = 0) => itipMail(from, uidAt, "REPLY", partstat, { seq });
 const deliverMail = (r: APIRequestContext, from: string, raw: string) => r.post(`/cdn-cgi/handler/email?from=${encodeURIComponent(from)}&to=${encodeURIComponent(ORG)}`, { data: raw, headers: { "content-type": "message/rfc822" } });
+const status = async (r: APIRequestContext, uid: string) => (await (await r.get(`/api/public/bookings/${uid}`)).json());
+const subjects = async (r: APIRequestContext, uid: string, prefix: string) => (await mailsFor(r, uid)).filter((m) => m.subject.startsWith(prefix));
 
-test("R19 calendar replies update RSVP status, a guest decline emails the host, a host decline asks to cancel", async ({ page, request }) => {
+test("R19 accepted is status only; a guest's decline cancels the booking and tells everyone", async ({ page, request }) => {
   const free = flat(await slots(request, "alex", "intro")).filter((s) => s.startsWith("2026-11-23"));
   const uid = (await (await book(request, "alex", "intro", free[0], { name: "Rae Reply", email: "rae@example.com" })).json()).uid;
   await expect.poll(async () => (await mailsFor(request, uid)).length).toBe(2);
   const UID = prop((await mailsFor(request, uid))[0].ics, "UID")!;
   expect((await deliverMail(request, "alex@example.com", replyMail("alex@example.com", UID, "ACCEPTED"))).ok()).toBe(true);
-  expect((await deliverMail(request, "rae@example.com", replyMail("rae@example.com", UID, "DECLINED"))).ok()).toBe(true);
-  await expect.poll(async () => (await mailsFor(request, uid)).filter((m) => m.subject.startsWith("Declined:")).map((m) => m.recipient)).toEqual(["alex@example.com"]);
   await login(page);
   await page.goto("/bookings/upcoming");
   const row = page.locator(`[data-uid="${uid}"]`);
   await expect(row.getByRole("list", { name: "Replies" })).toContainText("You Accepted");
-  await expect(row.getByRole("list", { name: "Replies" })).toContainText("Rae Reply Declined");
-  // the host declines their own copy: the booking stays, with a prompt
-  expect((await deliverMail(request, "alex@example.com", replyMail("alex@example.com", UID, "DECLINED").replace("DTSTAMP:20261115T120000Z", "DTSTAMP:20261115T130000Z"))).ok()).toBe(true);
+  expect((await mailsFor(request, uid)).length).toBe(2);
+  // the guest declines in their calendar: cancelled, CANCEL to both (the guest's own copy too)
+  expect((await deliverMail(request, "rae@example.com", replyMail("rae@example.com", UID, "DECLINED"))).ok()).toBe(true);
+  await expect.poll(async () => (await subjects(request, uid, "Cancelled:")).map((m) => m.recipient).sort()).toEqual(["alex@example.com", "rae@example.com"]);
+  for (const m of await subjects(request, uid, "Cancelled:")) {
+    expect(prop(m.ics, "METHOD")).toBe("CANCEL"); expect(prop(m.ics, "SEQUENCE")).toBe("1"); expect(prop(m.ics, "STATUS")).toBe("CANCELLED"); expect(prop(m.ics, "UID")).toBe(UID);
+  }
+  expect((await subjects(request, uid, "Cancelled:")).find((m) => m.recipient === "alex@example.com").text).toContain("Rae Reply cancelled this meeting. Reason: Declined in their calendar");
+  expect(await status(request, uid)).toMatchObject({ status: "cancelled", cancelled_by: "guest" });
+  // the slot is free again, and nothing was sent back as a reply
+  expect(flat(await slots(request, "alex", "intro"))).toContain(free[0]);
+  await page.goto("/bookings/cancelled");
+  await expect(page.locator(`[data-uid="${uid}"]`)).toBeVisible();
+  expect((await mailsFor(request, uid)).every((m) => !/METHOD:REPLY/.test(m.ics))).toBe(true);
+});
+
+test("R19 a proposed new time: held, offered to the other party, accepted, refused when unavailable, declined", async ({ page, request }) => {
+  const day = flat(await slots(request, "alex", "intro"));
+  const t0 = day.filter((s) => s.startsWith("2026-11-25"))[0], t1 = day.filter((s) => s.startsWith("2026-11-26"))[2], t2 = day.filter((s) => s.startsWith("2026-11-26"))[6];
+  const uid = (await (await book(request, "alex", "intro", t0, { name: "Cora Counter", email: "cora@example.com" })).json()).uid;
+  await expect.poll(async () => (await mailsFor(request, uid)).length).toBe(2);
+  const UID = prop((await mailsFor(request, uid))[0].ics, "UID")!;
+  // the guest proposes t1: only the host is asked, at SEQUENCE 1, with an answer requested
+  expect((await deliverMail(request, "cora@example.com", itipMail("cora@example.com", UID, "COUNTER", "NEEDS-ACTION", { start: t1 }))).ok()).toBe(true);
+  await expect.poll(async () => (await subjects(request, uid, "New time proposed:")).map((m) => m.recipient)).toEqual(["alex@example.com"]);
+  const ask = (await subjects(request, uid, "New time proposed:"))[0];
+  expect(prop(ask.ics, "METHOD")).toBe("REQUEST"); expect(prop(ask.ics, "SEQUENCE")).toBe("1"); expect(prop(ask.ics, "DTSTART")).toBe(icsTime(t1));
+  expect(ask.ics.replace(/\r\n[ \t]/g, "")).toContain("PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:alex@example.com");
+  expect(ask.text).toContain("Cora Counter proposed a new time");
+  // both times are held until the host answers
+  expect((await status(request, uid)).start_utc).toBe(t0);
+  const now = flat(await slots(request, "alex", "intro"));
+  expect(now).not.toContain(t0); expect(now).not.toContain(t1);
+  await login(page);
+  await page.goto("/bookings/upcoming");
+  await expect(page.locator(`[data-uid="${uid}"]`).getByRole("status")).toContainText("Cora Counter proposed a new time");
+  // the host accepts the proposal in their calendar: moved, final REQUEST to both at SEQUENCE 2, old time freed
+  expect((await deliverMail(request, "alex@example.com", replyMail("alex@example.com", UID, "ACCEPTED", 1))).ok()).toBe(true);
+  await expect.poll(async () => (await subjects(request, uid, "Moved:")).map((m) => m.recipient).sort()).toEqual(["alex@example.com", "cora@example.com"]);
+  for (const m of await subjects(request, uid, "Moved:")) { expect(prop(m.ics, "SEQUENCE")).toBe("2"); expect(prop(m.ics, "DTSTART")).toBe(icsTime(t1)); }
+  expect((await status(request, uid)).start_utc).toBe(t1);
+  expect(flat(await slots(request, "alex", "intro"))).toContain(t0);
   await page.reload();
-  await expect(row.getByRole("alert")).toContainText("You declined this in your calendar. Cancel the booking?");
-  await row.getByRole("button", { name: "Keep it" }).click();
-  await expect(row.getByRole("alert")).toHaveCount(0);
-  expect((await (await request.get(`/api/public/bookings/${uid}`)).json()).status).toBe("accepted");
-  // nothing ever goes back to a sender who isn't the host, and the outbox has no reply to the inbound mails
-  expect((await mailsFor(request, uid)).filter((m) => m.recipient === "rae@example.com").length).toBe(1);
+  await expect(page.locator(`[data-uid="${uid}"]`).getByRole("status")).toHaveCount(0);
+  // a time outside working hours (Sunday) is refused with DECLINECOUNTER; nothing changes
+  expect((await deliverMail(request, "cora@example.com", itipMail("cora@example.com", UID, "COUNTER", "NEEDS-ACTION", { seq: 2, start: "2026-11-22T15:00:00.000Z" }))).ok()).toBe(true);
+  await expect.poll(async () => (await subjects(request, uid, "New time not available:")).map((m) => m.recipient)).toEqual(["cora@example.com"]);
+  const no = (await subjects(request, uid, "New time not available:"))[0];
+  expect(prop(no.ics, "METHOD")).toBe("DECLINECOUNTER"); expect(no.mime).toContain("method=DECLINECOUNTER"); expect(no.text).toContain("That time isn't available.");
+  expect((await status(request, uid)).start_utc).toBe(t1);
+  // the host proposes t2; the guest declines it: the meeting is cancelled for both
+  expect((await deliverMail(request, "alex@example.com", itipMail("alex@example.com", UID, "COUNTER", "NEEDS-ACTION", { seq: 2, start: t2 }))).ok()).toBe(true);
+  await expect.poll(async () => (await subjects(request, uid, "New time proposed:")).map((m) => m.recipient)).toEqual(["alex@example.com", "cora@example.com"]);
+  expect((await deliverMail(request, "cora@example.com", replyMail("cora@example.com", UID, "DECLINED", 3))).ok()).toBe(true);
+  await expect.poll(async () => (await subjects(request, uid, "Cancelled:")).map((m) => m.recipient).sort()).toEqual(["alex@example.com", "cora@example.com"]);
+  for (const m of await subjects(request, uid, "Cancelled:")) { expect(prop(m.ics, "METHOD")).toBe("CANCEL"); expect(prop(m.ics, "SEQUENCE")).toBe("4"); }
+  expect(await status(request, uid)).toMatchObject({ status: "cancelled", cancelled_by: "guest", cancel_reason: "Declined the proposed new time" });
+  const after = flat(await slots(request, "alex", "intro"));
+  expect(after).toContain(t1); expect(after).toContain(t2);
+});
+
+test("R19 mail from the organizer address itself is refused (loop guard)", async ({ request }) => {
+  const r = await request.post(`/cdn-cgi/handler/email?from=${encodeURIComponent(ORG)}&to=${encodeURIComponent(ORG)}`, { data: replyMail(ORG, "x@127.0.0.1", "DECLINED"), headers: { "content-type": "message/rfc822" } });
+  expect(r.ok()).toBe(false);
 });

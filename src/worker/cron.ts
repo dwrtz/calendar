@@ -1,7 +1,8 @@
-// Scheduled handler (Cron Trigger */5 * * * *): reminders and retries (R15), iCal polling (R17).
+// Scheduled handler (Cron Trigger */5 * * * *): expired proposed times (R19), reminders and retries (R15), iCal polling (R17).
 import { database } from "./db";
 import { makeMailer, provider } from "./email";
 import { makeCalendars } from "./calendars";
+import { expireDue } from "./changes";
 
 export async function runScheduled(env: any) {
   const db = database(env, new Request("https://cron.invalid/"));
@@ -15,7 +16,12 @@ export async function runScheduled(env: any) {
       try {
         const origin = String(env.SITE_URL || "").replace(/\/$/, "");
         if (!origin) out.email = { error: "Set SITE_URL so reminder links point at your site" };
-        else out.email = await makeMailer(env, db, origin).runReminders();
+        else {
+          const mailer = makeMailer(env, db, origin);
+          // Proposed new times nobody answered before their deadline (R19) go first, so reminders use the kept time.
+          out.changesExpired = await expireDue(db, mailer);
+          out.email = await mailer.runReminders();
+        }
       } catch (e: any) { out.email = { error: String(e?.message ?? e) }; console.error(JSON.stringify({ cron: "email", error: String(e?.message ?? e) })); }
     }
     try { out.ical = await makeCalendars(env, db).pollDue(); }

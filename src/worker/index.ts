@@ -9,6 +9,7 @@ import {COLORS} from "../shared/colors";
 import {buildInvite} from "../shared/ics";
 import {makeMailer,emailOn,emailProblem,provider,organizerFor,type Kind} from "./email";
 import {receiveEmail} from "./email-handler";
+import {clearChanges,pendingChange} from "./changes";
 import {normAddress} from "../shared/itip";
 import {makeCalendars,FeedError,pollMinutes,USE_BLOCKS_SQL} from "./calendars";
 import {MissingKeyError} from "./crypto";
@@ -334,6 +335,8 @@ app.post("/api/public/bookings", wrap(async (req: any, res: any) => {
         old = await loadMovable(b.reschedule);
         if (old.host_id !== u.id || old.event_type_id !== e.id)
             throw new HttpError(400, "Wrong event type");
+        // A proposed new time already sent out (R19) used a higher SEQUENCE than the booking's own.
+        old.ics_sequence = Math.max(old.ics_sequence ?? 0, (await pendingChange(db, old.uid))?.sequence ?? 0);
     }
     // Fast path: the time must be a slot right now (hours, notice, horizon, buffers, daily limit).
     const free = await slotsFor(e, dt.minus({ hours: 12 }).toISO()!, dt.plus({ hours: 12 }).toISO()!, old?.uid);
@@ -356,7 +359,7 @@ app.post("/api/public/bookings", wrap(async (req: any, res: any) => {
               AND y.start_ms >= ?23 AND y.start_ms < ?24) < ?22)
         AND (?19 IS NULL OR EXISTS (SELECT 1 FROM bookings z WHERE z.uid=?19 AND z.status IN ('accepted','pending')))
         AND NOT EXISTS (SELECT 1 FROM busy_blocks bb WHERE bb.user_id=?3 AND ?7 - ?9*60000 < bb.end_ms AND ?8 + ?10*60000 > bb.start_ms
-              AND ${USE_BLOCKS_SQL.replace("?", "?27")})`).bind(
+              AND bb.source IS NOT ('hold:' || ?19) AND (bb.source LIKE 'hold:%' OR ${USE_BLOCKS_SQL.replace("?", "?27")}))`).bind(
         uid, e.id, u.id, e.title, start, end, sMs, eMs, e.buffer_before_min, e.buffer_after_min, e.requires_approval && !hostMove ? "pending" : "accepted",
         b.name.trim(), b.email.toLowerCase(), b.phone ?? "", b.timeZone, b.notes ?? "", JSON.stringify(e.hide_guests ? [] : b.guests ?? []), location,
         old?.uid ?? null, b.rescheduleReason ?? "", nowIso(), e.max_per_day ?? null, day.toMillis(), day.plus({ days: 1 }).toMillis(),
@@ -368,6 +371,8 @@ app.post("/api/public/bookings", wrap(async (req: any, res: any) => {
     catch (err: any) { if (!/UNIQUE/i.test(String(err?.message ?? err))) throw err; }
     if (!inserted)
         throw new HttpError(409, "Someone just took this time. Pick another.");
+    if (old)
+        await clearChanges(db, old.uid, "superseded");
     notify(old ? "moved" : e.requires_approval && !hostMove ? "requested" : "confirmed", uid);
     res.status(201).json({ uid });
 }));
@@ -385,7 +390,9 @@ async function cancelBooking(uid: string, who: "guest" | "host", reason = "") {
     const b = await loadMovable(uid);
     if (reason.length > 1000)
         throw new HttpError(400, "Reason is too long");
-    await run("UPDATE bookings SET status='cancelled',cancel_reason=?,cancelled_by=?,ics_sequence=ics_sequence+1 WHERE uid=?", reason, who, uid);
+    // A pending proposed new time (R19) ends with the booking; the CANCEL outranks any SEQUENCE already sent.
+    const seq = Math.max(b.ics_sequence ?? 0, await clearChanges(db, uid));
+    await run("UPDATE bookings SET status='cancelled',cancel_reason=?,cancelled_by=?,ics_sequence=? WHERE uid=?", reason, who, seq + 1, uid);
     // Only an accepted booking had an invite, so only it gets a METHOD:CANCEL one.
     notify("cancelled", uid, { noInvite: b.status !== "accepted" });
     return await bookingFull(uid);
@@ -413,13 +420,18 @@ app.get("/api/bookings", wrap(async (req: any, res: any) => {
         items.pop();
     // Each participant's calendar reply (R19); "" partstat means no reply yet.
     const rsvps = items.length ? await all<any>(`SELECT * FROM booking_rsvps WHERE booking_uid IN (${items.map(() => "?").join(",")})`, ...items.map((b) => b.uid)) : [];
+    // A proposed new time waiting for the other party's answer (R19).
+    const changes = items.length ? await all<any>(`SELECT * FROM booking_changes WHERE status='pending' AND booking_uid IN (${items.map(() => "?").join(",")})`, ...items.map((b) => b.uid)) : [];
     const withRsvps = items.map((b) => {
         const guests = JSON.parse(b.guests) as string[], mine = rsvps.filter((r) => r.booking_uid === b.uid);
         const pick = (email: string) => mine.find((r) => r.email === normAddress(email));
         const person = (email: string, name: string, role: "host" | "guest") => { const r = pick(email);
-            return { email, name, role, partstat: r?.partstat ?? "", comment: r?.comment ?? "", counterStart: r?.counter_start ?? null, counterEnd: r?.counter_end ?? null }; };
+            return { email, name, role, partstat: r?.partstat ?? "", comment: r?.comment ?? "" }; };
         const participants = [person(u.email, u.name, "host"), person(b.booker_email, b.booker_name, "guest"), ...guests.filter((g) => g && g !== b.booker_email).map((g) => person(g, g, "guest"))];
-        return { ...b, guests, participants, hostDeclined: mine.some((r) => r.role === "host" && r.host_prompt === 1) };
+        const c = changes.find((x) => x.booking_uid === b.uid);
+        const pendingChange = c ? { start: c.start_utc, end: c.end_utc, proposerName: c.proposer_name || c.proposer_email, proposerRole: c.proposer_role,
+            counterpartName: c.counterpart_name || c.counterpart_email, expiresAt: c.expires_at } : null;
+        return { ...b, guests, participants, pendingChange };
     });
     res.json({ items: withRsvps, nextCursor: more ? String(offset + 20) : null, counts });
 }));
@@ -430,12 +442,6 @@ app.post("/api/bookings/:uid/:action", wrap(async (req: any, res: any) => {
     const action = req.params.action;
     if (action === "cancel") {
         res.json(await cancelBooking(b.uid, "host", req.body.reason ?? ""));
-        return;
-    }
-    if (action === "keep") {
-        // The host declined their calendar copy and chose to keep the booking: clear the prompt (R19).
-        await run("UPDATE booking_rsvps SET host_prompt=0 WHERE booking_uid=? AND role='host'", b.uid);
-        res.json(await bookingFull(b.uid));
         return;
     }
     if (!["accept", "decline"].includes(action))

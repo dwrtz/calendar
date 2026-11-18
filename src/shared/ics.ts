@@ -4,7 +4,9 @@ export type InviteBooking = {
   hostName: string; hostEmail: string; bookerName: string; bookerEmail: string; guests: string[];
 };
 export type InviteKind = "request" | "cancel" | "publish";
-export type InviteContext = { origin: string; appName: string; now: string; audience: "host" | "guest"; organizer?: { name: string; email: string } };
+export type InviteContext = { origin: string; appName: string; now: string; audience: "host" | "guest"; organizer?: { name: string; email: string };
+  /** R19: the attendee asked to answer this version (a proposed new time): PARTSTAT=NEEDS-ACTION;RSVP=TRUE for them. */
+  needsAction?: string };
 
 export function escapeText(s: string): string {
   return String(s ?? "").replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r\n|\r|\n/g, "\\n");
@@ -37,6 +39,8 @@ export function buildInvite(b: InviteBooking, kind: InviteKind, sequence: number
   const summary = `${b.title} with ${ctx.audience === "host" ? b.bookerName : b.hostName}`;
   const isLink = /^https?:\/\//i.test(b.location);
   const desc = [b.notes ? `Notes: ${b.notes}` : "", isLink ? `Join: ${b.location}` : "", `Reschedule: ${page}`, `Cancel: ${page}`].filter(Boolean).join("\n");
+  const ask = String(ctx.needsAction ?? "").toLowerCase();
+  const ps = (e: string) => (ask && e.toLowerCase() === ask ? "PARTSTAT=NEEDS-ACTION;RSVP=TRUE" : "PARTSTAT=ACCEPTED;RSVP=FALSE");
   const attendees = [b.bookerEmail, ...(b.guests ?? [])].filter((e, i, a) => e && a.indexOf(e) === i);
   const lines = [
     "BEGIN:VCALENDAR", "VERSION:2.0", `PRODID:-//${escapeText(ctx.appName)}//Scheduler//EN`, "CALSCALE:GREGORIAN", `METHOD:${method}`,
@@ -48,13 +52,37 @@ export function buildInvite(b: InviteBooking, kind: InviteKind, sequence: number
     `DTEND:${icsTime(b.endUtc)}`,
     `SUMMARY:${escapeText(summary)}`,
     ctx.organizer ? `ORGANIZER;CN=${param(ctx.organizer.name)}:mailto:${ctx.organizer.email}` : `ORGANIZER;CN=${param(b.hostName)}:mailto:${b.hostEmail}`,
-    `ATTENDEE;CN=${param(b.hostName)};ROLE=${ctx.organizer ? "REQ-PARTICIPANT" : "CHAIR"};PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:${b.hostEmail}`,
-    ...attendees.map((e) => `ATTENDEE;CN=${param(e === b.bookerEmail ? b.bookerName : e)};ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:${e}`),
+    `ATTENDEE;CN=${param(b.hostName)};ROLE=${ctx.organizer ? "REQ-PARTICIPANT" : "CHAIR"};${ps(b.hostEmail)}:mailto:${b.hostEmail}`,
+    ...attendees.map((e) => `ATTENDEE;CN=${param(e === b.bookerEmail ? b.bookerName : e)};ROLE=REQ-PARTICIPANT;${ps(e)}:mailto:${e}`),
     `STATUS:${kind === "cancel" ? "CANCELLED" : "CONFIRMED"}`,
     "TRANSP:OPAQUE",
     `LOCATION:${escapeText(b.location)}`,
     `URL:${page}`,
     `DESCRIPTION:${escapeText(desc)}`,
+    "END:VEVENT", "END:VCALENDAR",
+  ];
+  return lines.map(foldLine).join("\r\n") + "\r\n";
+}
+
+/**
+ * iTIP DECLINECOUNTER (RFC 5546 3.2.8): the organizer refuses a proposed new time (R19). The event is unchanged; the
+ * proposer's calendar keeps the current version.
+ */
+export function buildDeclineCounter(b: Pick<InviteBooking, "uid" | "icsUid" | "title" | "startUtc" | "endUtc">, sequence: number,
+  ctx: { origin: string; now: string; organizer: { name: string; email: string }; attendee: { name: string; email: string }; comment: string }): string {
+  const host = (() => { try { return new URL(ctx.origin).hostname; } catch { return "scheduler"; } })();
+  const lines = [
+    "BEGIN:VCALENDAR", "VERSION:2.0", `PRODID:-//${escapeText(ctx.organizer.name)}//Scheduler//EN`, "METHOD:DECLINECOUNTER",
+    "BEGIN:VEVENT",
+    `UID:${b.icsUid || b.uid}@${host}`,
+    `SEQUENCE:${sequence}`,
+    `DTSTAMP:${icsTime(ctx.now)}`,
+    `DTSTART:${icsTime(b.startUtc)}`,
+    `DTEND:${icsTime(b.endUtc)}`,
+    `SUMMARY:${escapeText(b.title)}`,
+    `ORGANIZER;CN=${param(ctx.organizer.name)}:mailto:${ctx.organizer.email}`,
+    `ATTENDEE${ctx.attendee.name ? `;CN=${param(ctx.attendee.name)}` : ""}:mailto:${ctx.attendee.email}`,
+    ...(ctx.comment ? [`COMMENT:${escapeText(ctx.comment)}`] : []),
     "END:VEVENT", "END:VCALENDAR",
   ];
   return lines.map(foldLine).join("\r\n") + "\r\n";
