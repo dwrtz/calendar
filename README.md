@@ -1,5 +1,7 @@
 # Scheduler
 
+[![Built from a Spekkr spec](https://img.shields.io/badge/built%20from-Spekkr%20spec-f0442b)](https://spekkr.com/dwrtz/scheduling-app/)
+
 Built from the Spekkr spec dwrtz/scheduling-app: https://spekkr.com/dwrtz/scheduling-app/
 
 Build line: `Build the spec at https://spekkr.com/dwrtz/scheduling-app/start.md`
